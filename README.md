@@ -10,6 +10,9 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 - `FEISHU_APP_SECRET`
 - `FEISHU_APP_TOKEN`
 - `FEISHU_TABLE_ID`
+- `FEISHU_STATUS_FIELD`
+- `FEISHU_STATUS_ACTIVE_VALUE`
+- `FEISHU_STATUS_LEFT_VALUE`
 - `WHITELIST_GROUPS`
 - `MAX_RETRIES`
 - `RETRY_DELAY`
@@ -17,6 +20,16 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 - `ENABLE_STARTUP_REQUEST_SCAN`
 - `STARTUP_REQUEST_SCAN_LIMIT`
 - `PENDING_CHECK_INTERVAL`
+
+## 成员状态同步
+
+- 请在飞书多维表格中新增一个状态字段（默认字段名：`状态`）。
+- 插件在成员登记入群时会写入默认状态（默认值：`在群`）。
+- 当白名单群收到 `group_decrease`（退群/被踢）事件时，会按 `QQ号` 定位记录并将状态更新为 `已退群`。
+- 当成员退群后重新入群时，插件会先按 `QQ号` 查找既有记录：
+	- 若找到，则更新该记录（`UID`/`昵称`/`时间`/`状态`），避免新增重复行。
+	- 若未找到，才会新建记录。
+- 如你的表字段命名不同，可通过 `FEISHU_STATUS_FIELD`、`FEISHU_STATUS_ACTIVE_VALUE`、`FEISHU_STATUS_LEFT_VALUE` 自定义。
 
 ## 白名单行为
 

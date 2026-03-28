@@ -7,7 +7,10 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 
-from .feishu_client import append_row_with_retry
+from .feishu_client import (
+    upsert_member_row_by_qq_with_retry,
+    update_member_status_by_qq_with_retry,
+)
 from .storage import (
     is_group_whitelisted,
     load_whitelist,
@@ -353,8 +356,34 @@ class BiliVerifyFeishuPlugin(Star):
             notice_type = raw.get("notice_type")
             if notice_type == "group_increase":
                 await self._on_member_increase(event, raw)
+            elif notice_type == "group_decrease":
+                await self._on_member_decrease(event, raw)
         elif post_type == "message" and raw.get("message_type") == "group":
             await self._on_group_message(event, raw)
+
+    def _get_status_config(self) -> tuple[str, str, str]:
+        """读取状态字段配置。"""
+        status_field = str(self._get_config("FEISHU_STATUS_FIELD", "状态") or "状态").strip()
+        active_value = str(self._get_config("FEISHU_STATUS_ACTIVE_VALUE", "在群") or "在群").strip()
+        left_value = str(self._get_config("FEISHU_STATUS_LEFT_VALUE", "已退群") or "已退群").strip()
+        return status_field, active_value, left_value
+
+    def _build_fields_for_join(
+        self,
+        uid_num: int,
+        qq_num: int,
+        nickname: str,
+        time_ms: int,
+    ) -> dict[str, Any]:
+        """构造入群登记写入字段，包含成员状态。"""
+        status_field, active_value, _ = self._get_status_config()
+        return {
+            "UID": uid_num,
+            "QQ号": qq_num,
+            "昵称": nickname,
+            "时间": time_ms,
+            status_field: active_value,
+        }
 
     async def _set_group_add_request(
         self,
@@ -436,14 +465,19 @@ class BiliVerifyFeishuPlugin(Star):
         time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         nickname = await self._resolve_nickname(user_id=user_id, event=event, raw=raw)
 
-        fields = {
-            "UID": uid_num,
-            "QQ号": qq_num,
-            "昵称": nickname,
-            "时间": time_ms,
-        }
+        fields = self._build_fields_for_join(
+            uid_num=uid_num,
+            qq_num=qq_num,
+            nickname=nickname,
+            time_ms=time_ms,
+        )
 
-        success = await append_row_with_retry(fields, self.config)
+        success = await upsert_member_row_by_qq_with_retry(
+            fields=fields,
+            qq_num=qq_num,
+            config=self.config,
+            qq_field_name="QQ号",
+        )
         if success:
             logger.info(
                 "[BiliVerifyFeishu] 加群请求备注UID写入成功: "
@@ -502,6 +536,47 @@ class BiliVerifyFeishuPlugin(Star):
         logger.info(f"[BiliVerifyFeishu] 用户 {user_id} 加入白名单群 {group_id}")
         self._pending_uid.add(key)
 
+    async def _on_member_decrease(self, event: AstrMessageEvent, raw: dict):
+        """处理成员退群事件并回写飞书状态。"""
+        group_id = str(raw.get("group_id", ""))
+        user_id = str(raw.get("user_id", ""))
+        sub_type = str(raw.get("sub_type", ""))
+
+        if not group_id or not user_id or not is_group_whitelisted(group_id):
+            return
+
+        key = f"{group_id}:{user_id}"
+        self._pending_uid.discard(key)
+        self._verified_before_join.discard(key)
+
+        try:
+            qq_num = int(user_id)
+        except ValueError:
+            logger.warning(
+                f"[BiliVerifyFeishu] 退群事件 user_id 非数字，跳过状态回写: {user_id}"
+            )
+            return
+
+        status_field, _, left_value = self._get_status_config()
+        success = await update_member_status_by_qq_with_retry(
+            qq_num=qq_num,
+            status_value=left_value,
+            config=self.config,
+            qq_field_name="QQ号",
+            status_field_name=status_field,
+        )
+
+        if success:
+            logger.info(
+                "[BiliVerifyFeishu] 成员退群状态回写成功: "
+                f"group={group_id}, user={user_id}, sub_type={sub_type}, status={left_value}"
+            )
+        else:
+            logger.error(
+                "[BiliVerifyFeishu] 成员退群状态回写失败: "
+                f"group={group_id}, user={user_id}, sub_type={sub_type}, status={left_value}"
+            )
+
     async def _on_group_message(self, event: AstrMessageEvent, raw: dict):
         """处理群聊消息，提取 B站 UID 并写入飞书。"""
         group_id = str(raw.get("group_id", ""))
@@ -534,15 +609,20 @@ class BiliVerifyFeishuPlugin(Star):
         time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         # 构造写入飞书的字段数据
-        fields = {
-            "UID": uid_num,
-            "QQ号": qq_num,
-            "昵称": nickname,
-            "时间": time_ms,
-        }
+        fields = self._build_fields_for_join(
+            uid_num=uid_num,
+            qq_num=qq_num,
+            nickname=nickname,
+            time_ms=time_ms,
+        )
 
         # 写入飞书（带重试）
-        success = await append_row_with_retry(fields, self.config)
+        success = await upsert_member_row_by_qq_with_retry(
+            fields=fields,
+            qq_num=qq_num,
+            config=self.config,
+            qq_field_name="QQ号",
+        )
 
         if success:
             logger.info(f"[BiliVerifyFeishu] 飞书写入成功: UID={uid}, QQ={user_id}")

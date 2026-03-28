@@ -7,6 +7,9 @@ FEISHU_APP_ID: "cli_xxxxxxxxxxxx"
 FEISHU_APP_SECRET: "xxxxxxxxxxxxxxxxxxxxxxxx"
 FEISHU_APP_TOKEN: "appxxxxxxxxxxxxxxxx"
 FEISHU_TABLE_ID: "tblxxxxxxxxxxxx"
+FEISHU_STATUS_FIELD: "状态"
+FEISHU_STATUS_ACTIVE_VALUE: "在群"
+FEISHU_STATUS_LEFT_VALUE: "已退群"
 
 WHITELIST_GROUPS:
   - "123456789"

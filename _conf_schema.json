@@ -27,6 +27,22 @@
     "default": "",
     "obvious_hint": true
   },
+  "FEISHU_STATUS_FIELD": {
+    "description": "飞书状态字段名",
+    "type": "string",
+    "hint": "用于标记成员是否在群中，默认字段名为 状态",
+    "default": "状态"
+  },
+  "FEISHU_STATUS_ACTIVE_VALUE": {
+    "description": "成员在群中的状态值",
+    "type": "string",
+    "default": "在群"
+  },
+  "FEISHU_STATUS_LEFT_VALUE": {
+    "description": "成员退群后的状态值",
+    "type": "string",
+    "default": "已退群"
+  },
   "WHITELIST_GROUPS": {
     "description": "白名单群号列表",
     "type": "list",

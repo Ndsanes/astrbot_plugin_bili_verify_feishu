@@ -8,6 +8,11 @@ import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import (
     CreateAppTableRecordRequest,
     CreateAppTableRecordResponse,
+    SearchAppTableRecordRequest,
+    SearchAppTableRecordRequestBody,
+    SearchAppTableRecordResponse,
+    UpdateAppTableRecordRequest,
+    UpdateAppTableRecordResponse,
 )
 
 try:
@@ -234,4 +239,287 @@ async def append_row_with_retry(
             await asyncio.sleep(delay)
 
     logger.error(f"飞书写入失败，已重试 {_max_retries} 次")
+    return False
+
+
+def _first_record_id_from_search_response(response: SearchAppTableRecordResponse) -> str:
+    """从搜索响应中提取首条记录 ID。"""
+    data = getattr(response, "data", None)
+    items = getattr(data, "items", None)
+    if not isinstance(items, list) or not items:
+        return ""
+
+    first_item = items[0]
+    record_id = getattr(first_item, "record_id", "")
+    if record_id:
+        return str(record_id).strip()
+
+    if isinstance(first_item, dict):
+        return str(first_item.get("record_id", "")).strip()
+
+    return ""
+
+
+async def _find_record_id_by_qq(
+    qq_num: int,
+    config: Mapping[str, Any],
+    qq_field_name: str = "QQ号",
+) -> tuple[bool, str]:
+    """按 QQ 查询首条记录，返回(查询成功, record_id)。"""
+    app_token, table_id = _normalize_bitable_ids(
+        config.get("FEISHU_APP_TOKEN", ""),
+        config.get("FEISHU_TABLE_ID", ""),
+    )
+    if not app_token or not table_id:
+        logger.error("飞书查询失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
+        return False, ""
+
+    qq_field = str(qq_field_name).strip() or "QQ号"
+    client = _get_client(config)
+    filter_payload = {
+        "conjunction": "and",
+        "conditions": [
+            {
+                "field_name": qq_field,
+                "operator": "is",
+                "value": [qq_num],
+            }
+        ],
+    }
+
+    search_request: SearchAppTableRecordRequest = (
+        SearchAppTableRecordRequest.builder()
+        .app_token(app_token)
+        .table_id(table_id)
+        .page_size(1)
+        .request_body(
+            SearchAppTableRecordRequestBody.builder()
+            .filter(filter_payload)
+            .build()
+        )
+        .build()
+    )
+
+    try:
+        await _acquire_rate_limit_slot()
+        search_response: SearchAppTableRecordResponse = (
+            await client.bitable.v1.app_table_record.asearch(search_request)
+        )
+    except Exception as e:
+        logger.error(f"飞书查询记录异常: {e}")
+        return False, ""
+
+    if not search_response.success():
+        logger.error(
+            "飞书查询记录失败, "
+            f"code: {search_response.code}, msg: {search_response.msg}, "
+            f"log_id: {search_response.get_log_id()}"
+        )
+        return False, ""
+
+    record_id = _first_record_id_from_search_response(search_response)
+    return True, record_id
+
+
+async def upsert_member_row_by_qq(
+    fields: dict,
+    qq_num: int,
+    config: Mapping[str, Any],
+    qq_field_name: str = "QQ号",
+) -> bool:
+    """按 QQ 先查后写：命中则更新，未命中则新增。"""
+    found_ok, record_id = await _find_record_id_by_qq(
+        qq_num=qq_num,
+        config=config,
+        qq_field_name=qq_field_name,
+    )
+    if not found_ok:
+        return False
+
+    if not record_id:
+        return await append_row_to_table(fields, config)
+
+    app_token, table_id = _normalize_bitable_ids(
+        config.get("FEISHU_APP_TOKEN", ""),
+        config.get("FEISHU_TABLE_ID", ""),
+    )
+    if not app_token or not table_id:
+        logger.error("飞书更新失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
+        return False
+
+    client = _get_client(config)
+    update_request: UpdateAppTableRecordRequest = (
+        UpdateAppTableRecordRequest.builder()
+        .app_token(app_token)
+        .table_id(table_id)
+        .record_id(record_id)
+        .request_body(RecordBody.builder().fields(fields).build())
+        .build()
+    )
+
+    try:
+        await _acquire_rate_limit_slot()
+        update_response: UpdateAppTableRecordResponse = (
+            await client.bitable.v1.app_table_record.aupdate(update_request)
+        )
+    except Exception as e:
+        logger.error(f"飞书更新记录异常: {e}")
+        return False
+
+    if not update_response.success():
+        logger.error(
+            "飞书更新记录失败, "
+            f"code: {update_response.code}, msg: {update_response.msg}, "
+            f"log_id: {update_response.get_log_id()}"
+        )
+        return False
+
+    logger.info(f"飞书记录已按QQ复用更新: QQ={qq_num}, record_id={record_id}")
+    return True
+
+
+async def upsert_member_row_by_qq_with_retry(
+    fields: dict,
+    qq_num: int,
+    config: Mapping[str, Any],
+    qq_field_name: str = "QQ号",
+    max_retries: int | None = None,
+    retry_delay: float | None = None,
+) -> bool:
+    """按 QQ 先查后写，失败时指数退避重试。"""
+    _max_retries: int = _safe_int(
+        max_retries if max_retries is not None else config.get("MAX_RETRIES", 3),
+        default=3,
+        minimum=1,
+    )
+    _retry_delay: float = _safe_float(
+        retry_delay if retry_delay is not None else config.get("RETRY_DELAY", 1),
+        default=1.0,
+        minimum=0.0,
+    )
+
+    for attempt in range(_max_retries):
+        success = await upsert_member_row_by_qq(
+            fields=fields,
+            qq_num=qq_num,
+            config=config,
+            qq_field_name=qq_field_name,
+        )
+        if success:
+            return True
+
+        if attempt < _max_retries - 1:
+            delay = _retry_delay * (2**attempt)
+            logger.warning(
+                f"飞书按QQ复用写入失败，{delay:.1f}秒后进行第 {attempt + 2} 次重试..."
+            )
+            await asyncio.sleep(delay)
+
+    logger.error(f"飞书按QQ复用写入失败，已重试 {_max_retries} 次, QQ={qq_num}")
+    return False
+
+
+async def update_member_status_by_qq(
+    qq_num: int,
+    status_value: str,
+    config: Mapping[str, Any],
+    qq_field_name: str = "QQ号",
+    status_field_name: str = "状态",
+) -> bool:
+    """按 QQ 号查找并更新成员状态字段。"""
+    found_ok, record_id = await _find_record_id_by_qq(
+        qq_num=qq_num,
+        config=config,
+        qq_field_name=qq_field_name,
+    )
+    if not found_ok:
+        logger.error(f"飞书状态更新失败: 查询QQ对应记录失败, QQ={qq_num}")
+        return False
+
+    status_text = str(status_value).strip()
+    status_field = str(status_field_name).strip() or "状态"
+    if not record_id:
+        logger.warning(f"飞书状态更新跳过: 未找到QQ对应记录, QQ={qq_num}")
+        return False
+
+    app_token, table_id = _normalize_bitable_ids(
+        config.get("FEISHU_APP_TOKEN", ""),
+        config.get("FEISHU_TABLE_ID", ""),
+    )
+    if not app_token or not table_id:
+        logger.error("飞书状态更新失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
+        return False
+
+    client = _get_client(config)
+
+    update_request: UpdateAppTableRecordRequest = (
+        UpdateAppTableRecordRequest.builder()
+        .app_token(app_token)
+        .table_id(table_id)
+        .record_id(record_id)
+        .request_body(RecordBody.builder().fields({status_field: status_text}).build())
+        .build()
+    )
+
+    try:
+        await _acquire_rate_limit_slot()
+        update_response: UpdateAppTableRecordResponse = (
+            await client.bitable.v1.app_table_record.aupdate(update_request)
+        )
+    except Exception as e:
+        logger.error(f"飞书状态更新失败，更新记录异常: {e}")
+        return False
+
+    if not update_response.success():
+        logger.error(
+            "飞书状态更新失败，更新记录失败, "
+            f"code: {update_response.code}, msg: {update_response.msg}, "
+            f"log_id: {update_response.get_log_id()}"
+        )
+        return False
+
+    logger.info(f"飞书状态更新成功: QQ={qq_num}, 状态={status_text}, record_id={record_id}")
+    return True
+
+
+async def update_member_status_by_qq_with_retry(
+    qq_num: int,
+    status_value: str,
+    config: Mapping[str, Any],
+    qq_field_name: str = "QQ号",
+    status_field_name: str = "状态",
+    max_retries: int | None = None,
+    retry_delay: float | None = None,
+) -> bool:
+    """按 QQ 更新成员状态，失败时指数退避重试。"""
+    _max_retries: int = _safe_int(
+        max_retries if max_retries is not None else config.get("MAX_RETRIES", 3),
+        default=3,
+        minimum=1,
+    )
+    _retry_delay: float = _safe_float(
+        retry_delay if retry_delay is not None else config.get("RETRY_DELAY", 1),
+        default=1.0,
+        minimum=0.0,
+    )
+
+    for attempt in range(_max_retries):
+        success = await update_member_status_by_qq(
+            qq_num=qq_num,
+            status_value=status_value,
+            config=config,
+            qq_field_name=qq_field_name,
+            status_field_name=status_field_name,
+        )
+        if success:
+            return True
+
+        if attempt < _max_retries - 1:
+            delay = _retry_delay * (2**attempt)
+            logger.warning(
+                f"飞书状态更新失败，{delay:.1f}秒后进行第 {attempt + 2} 次重试..."
+            )
+            await asyncio.sleep(delay)
+
+    logger.error(f"飞书状态更新失败，已重试 {_max_retries} 次, QQ={qq_num}")
     return False
