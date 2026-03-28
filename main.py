@@ -33,6 +33,8 @@ class BiliVerifyFeishuPlugin(Star):
         )
         # 已入群但尚未提供 UID 的用户集合，格式: "{group_id}:{user_id}"
         self._pending_uid: set[str] = set()
+        # 已在入群请求阶段完成 UID 校验，等待 group_increase 落地的用户。
+        self._verified_before_join: set[str] = set()
         self._processed_request_keys: set[str] = set()
         self._pending_check_task: asyncio.Task | None = None
 
@@ -447,6 +449,9 @@ class BiliVerifyFeishuPlugin(Star):
                 "[BiliVerifyFeishu] 加群请求备注UID写入成功: "
                 f"UID={uid}, QQ={user_id}, 群={group_id}"
             )
+            # 该用户已在请求阶段完成 UID 校验，入群通知到达时不应再加入待补集合。
+            self._verified_before_join.add(f"{group_id}:{user_id}")
+            self._pending_uid.discard(f"{group_id}:{user_id}")
             await self._set_group_add_request(
                 event,
                 flag=flag,
@@ -484,8 +489,18 @@ class BiliVerifyFeishuPlugin(Star):
         if not is_group_whitelisted(group_id):
             return
 
+        key = f"{group_id}:{user_id}"
+        if key in self._verified_before_join:
+            self._verified_before_join.discard(key)
+            self._pending_uid.discard(key)
+            logger.info(
+                "[BiliVerifyFeishu] 用户已在入群请求阶段完成UID校验，"
+                f"跳过待补记录: group={group_id}, user={user_id}"
+            )
+            return
+
         logger.info(f"[BiliVerifyFeishu] 用户 {user_id} 加入白名单群 {group_id}")
-        self._pending_uid.add(f"{group_id}:{user_id}")
+        self._pending_uid.add(key)
 
     async def _on_group_message(self, event: AstrMessageEvent, raw: dict):
         """处理群聊消息，提取 B站 UID 并写入飞书。"""
