@@ -1,0 +1,71 @@
+{
+  "FEISHU_APP_ID": {
+    "description": "飞书应用 App ID",
+    "type": "string",
+    "hint": "在飞书开放平台应用凭证页面获取，例如 cli_xxx",
+    "default": "",
+    "obvious_hint": true
+  },
+  "FEISHU_APP_SECRET": {
+    "description": "飞书应用 App Secret",
+    "type": "string",
+    "hint": "在飞书开放平台应用凭证页面获取",
+    "default": "",
+    "obvious_hint": true
+  },
+  "FEISHU_APP_TOKEN": {
+    "description": "飞书多维表格 App Token",
+    "type": "string",
+    "hint": "多维表格 URL 中的 app_token，示例: https://xxx.feishu.cn/base/APPTOKEN?table=TABLEID",
+    "default": "",
+    "obvious_hint": true
+  },
+  "FEISHU_TABLE_ID": {
+    "description": "飞书多维表格 Table ID",
+    "type": "string",
+    "hint": "多维表格 URL 参数 table= 后面的值",
+    "default": "",
+    "obvious_hint": true
+  },
+  "WHITELIST_GROUPS": {
+    "description": "白名单群号列表",
+    "type": "list",
+    "hint": "仅白名单群启用登记流程。首次启动时会用于初始化持久化白名单。",
+    "default": []
+  },
+  "MAX_RETRIES": {
+    "description": "飞书写入失败最大重试次数",
+    "type": "int",
+    "default": 3
+  },
+  "RETRY_DELAY": {
+    "description": "重试基础延迟（秒）",
+    "type": "float",
+    "default": 1.0,
+    "hint": "采用指数退避: delay * 2^attempt,例如重试3次，基础延迟1秒，实际重试间隔分别为1s、2s、4s"
+  },
+  "ENABLE_PENDING_CHECK": {
+    "description": "是否启用未处理入群请求巡检",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后将不启动定时巡检任务，可用于临时停用巡检。（这个功能主要是防止机器人掉线后无法及时处理入群请求，重新上线后进行检查）"
+  },
+  "ENABLE_STARTUP_REQUEST_SCAN": {
+    "description": "启动时是否补偿扫描历史加群请求",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件加载时会调用 get_group_system_msg 处理加载前未处理的加群请求。"
+  },
+  "STARTUP_REQUEST_SCAN_LIMIT": {
+    "description": "启动补偿扫描最多处理请求数",
+    "type": "int",
+    "default": 50,
+    "hint": "用于限制单次启动补偿扫描处理量，防止历史积压过大导致启动阻塞。"
+  },
+  "PENDING_CHECK_INTERVAL": {
+    "description": "未处理入群请求巡检间隔（秒）",
+    "type": "int",
+    "default": 3800,
+    "hint": "插件会按该间隔检查白名单群中的待补UID和写入失败记录，并输出告警日志。最小值为10秒。"
+  }
+}
