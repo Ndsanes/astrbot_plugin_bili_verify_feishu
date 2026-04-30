@@ -201,6 +201,18 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local project ignores
+# Ignore t2i templates (user/templates not needed in repo)
+data/t2i_templates/
+
+# Local dev / env
+.venv/
+# Editor / OS
+.DS_Store
+
+# Project docs or notes that shouldn't be tracked
+开发原则.md
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
