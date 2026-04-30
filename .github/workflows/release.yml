@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build plugin zip
+        run: bash tools/package_astrbot_zip.sh
+
+      - name: Generate tag and changelog
+        id: meta
+        run: |
+          # 从 metadata.yaml 读取版本号
+          VERSION=$(grep '^version:' metadata.yaml | awk '{print $2}' | tr -d '"')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="${VERSION}-${SHORT_SHA}"
+
+          # 获取上一个 tag（如果存在）
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          # 生成 changelog
+          if [ -n "$PREV_TAG" ]; then
+            CHANGELOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges)
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          # 写入多行输出
+          {
+            echo "tag=${TAG}"
+            echo "changelog<<EOF"
+            echo "## Changes since ${PREV_TAG:-initial commit}"
+            echo ""
+            echo "${CHANGELOG}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Tag: ${TAG}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body: ${{ steps.meta.outputs.changelog }}
+          files: dist/astrbot_plugin_bili_verify_feishu.zip
+          make_latest: true
