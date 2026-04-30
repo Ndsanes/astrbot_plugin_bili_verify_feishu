@@ -120,7 +120,9 @@ class BiliVerifyFeishuPlugin(Star):
                 default=50,
                 minimum=1,
             )
-            await self._scan_unhandled_group_requests_on_startup(startup_scan_limit)
+            asyncio.create_task(
+                self._deferred_startup_scan(startup_scan_limit)
+            )
 
         enable_pending_check = self._safe_bool(
             self._get_config("ENABLE_PENDING_CHECK", True),
@@ -278,6 +280,15 @@ class BiliVerifyFeishuPlugin(Star):
             return ""
         return str(payload.get("nickname", "")).strip()
 
+    async def _deferred_startup_scan(self, limit: int):
+        """延迟执行启动补偿扫描，等待平台适配器就绪。"""
+        for _ in range(6):
+            await asyncio.sleep(1)
+            client = self._get_aiocqhttp_client()
+            if client is not None and hasattr(client, "api"):
+                break
+        await self._scan_unhandled_group_requests_on_startup(limit)
+
     async def _scan_unhandled_group_requests_on_startup(self, limit: int):
         """启动时补偿扫描未处理加群请求（覆盖插件加载前的请求）。"""
         client = self._get_aiocqhttp_client()
@@ -346,6 +357,8 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         raw = event.message_obj.raw_message
+        if raw is None:
+            return
         post_type = raw.get("post_type")
 
         if post_type == "request":
