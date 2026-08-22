@@ -21,6 +21,21 @@ from .storage import (
     add_to_pending,
 )
 
+# 深 modules — narrow interface behind seam（admission 整合后逐步收口）
+try:
+    from .admission import AdmissionService
+    from .admissions_store import AdmissionsStore
+    from .member_registry import MemberRegistry
+    from .platform_port import JoinRequest, OneBotAdapter, PlatformPort, QqOfficialAdapter
+    from .plugin_config import PluginConfig
+except Exception:  # pragma: no cover - 离线测试回退
+    AdmissionService = None  # type: ignore
+    AdmissionsStore = None  # type: ignore
+    MemberRegistry = None  # type: ignore
+    JoinRequest = None  # type: ignore
+    PlatformPort = None  # type: ignore
+    PluginConfig = None  # type: ignore
+
 
 @register(
     "bili_verify_feishu",
@@ -48,6 +63,12 @@ class BiliVerifyFeishuPlugin(Star):
         self._offline_monitor_task: asyncio.Task | None = None
         self._offline_fail_count: int = 0
         self._offline_is_down: bool = False
+        # 深 modules（initialize 时按 PluginConfig 实例化，提供 seam）
+        self._typed_config: Any | None = None
+        self._admissions_store: Any | None = None
+        self._member_registry: Any | None = None
+        self._admission_service: Any | None = None
+        self._platform_port: Any | None = None  # PlatformPort interface，两个 adapter 复用同一 seam
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         """读取 AstrBot 注入的插件配置。"""
@@ -125,6 +146,34 @@ class BiliVerifyFeishuPlugin(Star):
                 logger.warning(f"[BiliVerifyFeishu] 配置问题: {err}")
         whitelist = load_whitelist()
         logger.info(f"[BiliVerifyFeishu] 插件已初始化，白名单群数: {len(whitelist)}")
+
+        # 初始化深 modules（失败则回落到原浅路径，保持兼容）
+        try:
+            if PluginConfig is not None:
+                self._typed_config = PluginConfig.from_dict(dict(self.config) if isinstance(self.config, dict) else {})
+            if AdmissionsStore is not None:
+                self._admissions_store = AdmissionsStore()
+            if MemberRegistry is not None:
+                # 优先用 typed config 的 feishu 段
+                cfg_for_registry = dict(self.config) if isinstance(self.config, dict) else {}
+                # 适配 MemberRegistry.from_plugin_config 也可
+                self._member_registry = MemberRegistry(cfg_for_registry)
+            if AdmissionService is not None and self._member_registry is not None and self._admissions_store is not None and self._typed_config is not None:
+                self._admission_service = AdmissionService(
+                    registry=self._member_registry,
+                    store=self._admissions_store,
+                    config=self._typed_config,
+                )
+            # PlatformPort 按需实例化（两个 adapter 同一 seam）
+            if QqOfficialAdapter is not None and OneBotAdapter is not None:
+                # 仅作占位，实际 list/approve 时按平台选择 adapter
+                self._platform_port = {
+                    "qq_official": QqOfficialAdapter,
+                    "onebot": OneBotAdapter,
+                }
+            logger.info("[BiliVerifyFeishu] 深 modules 已就绪：MemberRegistry / AdmissionsStore / AdmissionService / PlatformPort")
+        except Exception as e:
+            logger.warning(f"[BiliVerifyFeishu] 深 modules 初始化失败，回落浅路径: {e}")
 
         enable_startup_scan = self._safe_bool(
             self._get_config("ENABLE_STARTUP_REQUEST_SCAN", True),
@@ -1252,7 +1301,43 @@ class BiliVerifyFeishuPlugin(Star):
         comment: str,
         raw_item: dict,
     ):
-        """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。"""
+        """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。优先走深 AdmissionService seam。"""
+        # 深路径：通过 AdmissionService 统一决策与落库（窄 interface）
+        if self._admission_service is not None and JoinRequest is not None:
+            try:
+                req = JoinRequest(
+                    group_openid=group_openid,
+                    member_openid=member_openid,
+                    join_request_id=join_request_id,
+                    username=username,
+                    comment=comment,
+                    raw=raw_item or {},
+                )
+                result = await self._admission_service.admit_request(req)
+                # 将 deep module 的决策映射回平台审批（seam 仍在 main 侧，保持两 adapter 可替换）
+                if result.decision == "approve":
+                    await self._qqofficial_approve_join_request(
+                        group_openid=group_openid,
+                        member_openid=member_openid,
+                        join_request_id=join_request_id,
+                        approve=True,
+                    )
+                elif result.reason == "not_whitelisted":
+                    return
+                else:
+                    # decline 场景（无 UID 等）
+                    reason = result.reason or "请在入群验证信息中提供B站UID"
+                    await self._qqofficial_approve_join_request(
+                        group_openid=group_openid,
+                        member_openid=member_openid,
+                        join_request_id=join_request_id,
+                        approve=False,
+                        reject_reason=reason,
+                    )
+                return
+            except Exception as e:
+                logger.warning(f"[BiliVerifyFeishu] 深 Admission 路径失败，回落浅路径: {e}")
+
         if not is_group_whitelisted(group_openid):
             logger.info(f"[BiliVerifyFeishu] 非白名单群入群申请，忽略: group={group_openid}, user={member_openid}")
             return
