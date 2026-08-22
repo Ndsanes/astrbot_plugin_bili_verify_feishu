@@ -1,4 +1,5 @@
 import asyncio
+import random
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +9,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 
 from .feishu_client import (
+    broadcast_feishu_message,
     upsert_member_row_by_qq_with_retry,
     update_member_status_by_qq_with_retry,
 )
@@ -24,7 +26,7 @@ from .storage import (
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.1.0",
+    "0.0.2",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -40,6 +42,10 @@ class BiliVerifyFeishuPlugin(Star):
         self._verified_before_join: set[str] = set()
         self._processed_request_keys: set[str] = set()
         self._pending_check_task: asyncio.Task | None = None
+        # QQ 掉线检测（通过飞书通知）
+        self._offline_monitor_task: asyncio.Task | None = None
+        self._offline_fail_count: int = 0
+        self._offline_is_down: bool = False
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         """读取 AstrBot 注入的插件配置。"""
@@ -66,6 +72,14 @@ class BiliVerifyFeishuPlugin(Star):
             if lowered in {"0", "false", "no", "off"}:
                 return False
         return default
+
+    def _safe_float(self, value: Any, default: float, minimum: float = 0.0) -> float:
+        """安全解析浮点配置，异常时回退默认值。"""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(parsed, minimum)
 
     def _validate_config(self) -> list[str]:
         """校验必填配置项是否完整。"""
@@ -128,22 +142,47 @@ class BiliVerifyFeishuPlugin(Star):
             self._get_config("ENABLE_PENDING_CHECK", True),
             default=True,
         )
-        if not enable_pending_check:
+        if enable_pending_check:
+            check_interval = self._safe_int(
+                self._get_config("PENDING_CHECK_INTERVAL", 60),
+                default=60,
+                minimum=10,
+            )
+            self._pending_check_task = asyncio.create_task(
+                self._periodic_pending_check(check_interval)
+            )
+            logger.info(
+                "[BiliVerifyFeishu] 已启动未处理入群请求巡检任务，"
+                f"间隔: {check_interval}s"
+            )
+        else:
             logger.info("[BiliVerifyFeishu] 未处理入群请求巡检已关闭")
-            return
 
-        check_interval = self._safe_int(
-            self._get_config("PENDING_CHECK_INTERVAL", 60),
-            default=60,
-            minimum=10,
+        # 启动 QQ 掉线检测（飞书通知）
+        enable_offline = self._safe_bool(
+            self._get_config("ENABLE_OFFLINE_NOTIFY", False),
+            default=False,
         )
-        self._pending_check_task = asyncio.create_task(
-            self._periodic_pending_check(check_interval)
-        )
-        logger.info(
-            "[BiliVerifyFeishu] 已启动未处理入群请求巡检任务，"
-            f"间隔: {check_interval}s"
-        )
+        if enable_offline:
+            raw_targets = self._get_config("OFFLINE_FEISHU_TARGETS", [])
+            has_targets = False
+            if isinstance(raw_targets, list):
+                has_targets = any(str(t).strip() for t in raw_targets)
+            elif isinstance(raw_targets, str):
+                has_targets = bool(raw_targets.strip())
+            if not has_targets:
+                logger.warning("[BiliVerifyFeishu] 已启用掉线检测但未配置 OFFLINE_FEISHU_TARGETS，掉线时仅记录日志")
+            offline_interval = self._safe_int(
+                self._get_config("OFFLINE_CHECK_INTERVAL", 60),
+                default=60,
+                minimum=10,
+            )
+            self._offline_monitor_task = asyncio.create_task(
+                self._offline_monitor_loop(offline_interval)
+            )
+            logger.info(f"[BiliVerifyFeishu] 已启动QQ掉线检测任务，间隔: {offline_interval}s（飞书通知）")
+        else:
+            logger.info("[BiliVerifyFeishu] QQ掉线检测（飞书通知）已关闭")
 
     async def _periodic_pending_check(self, interval_seconds: int):
         """定时巡检白名单群中的未处理入群请求。"""
@@ -158,7 +197,7 @@ class BiliVerifyFeishuPlugin(Star):
             logger.error(f"[BiliVerifyFeishu] 巡检任务异常退出: {e}")
 
     async def _check_unprocessed_requests(self):
-        """检查白名单群未处理数据并输出告警日志。"""
+        """检查白名单群未处理数据并输出告警日志，兼做掉线期间漏扫补偿。"""
         whitelist = set(load_whitelist())
         if not whitelist:
             return
@@ -174,26 +213,32 @@ class BiliVerifyFeishuPlugin(Star):
             if str(record.get("group_id", "")) in whitelist
         ]
 
-        if not pending_uid_entries and not pending_records:
-            return
+        if pending_uid_entries or pending_records:
+            sample_uid = ", ".join(pending_uid_entries[:3])
+            pending_groups = sorted(
+                {
+                    str(record.get("group_id", ""))
+                    for record in pending_records
+                    if str(record.get("group_id", ""))
+                }
+            )
+            sample_groups = ", ".join(pending_groups[:3])
 
-        sample_uid = ", ".join(pending_uid_entries[:3])
-        pending_groups = sorted(
-            {
-                str(record.get("group_id", ""))
-                for record in pending_records
-                if str(record.get("group_id", ""))
-            }
-        )
-        sample_groups = ", ".join(pending_groups[:3])
+            logger.warning(
+                "[BiliVerifyFeishu] 发现白名单群未处理入群请求: "
+                f"待补UID={len(pending_uid_entries)}"
+                f"{f'({sample_uid})' if sample_uid else ''}, "
+                f"写入失败待处理={len(pending_records)}"
+                f"{f'({sample_groups})' if sample_groups else ''}"
+            )
 
-        logger.warning(
-            "[BiliVerifyFeishu] 发现白名单群未处理入群请求: "
-            f"待补UID={len(pending_uid_entries)}"
-            f"{f'({sample_uid})' if sample_uid else ''}, "
-            f"写入失败待处理={len(pending_records)}"
-            f"{f'({sample_groups})' if sample_groups else ''}"
-        )
+        # 补偿扫描：尝试拉取 get_group_system_msg 处理掉线期间积压的请求
+        # 避免与启动扫描和掉线恢复扫描重复，用 _processed_request_keys 去重
+        try:
+            limit = self._safe_int(self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50), default=50, minimum=1)
+            await self._scan_unhandled_group_requests_on_startup(limit)
+        except Exception as e:
+            logger.debug(f"[BiliVerifyFeishu] 周期补偿扫描失败: {e}")
 
     def _get_aiocqhttp_client(self, event: AstrMessageEvent | None = None):
         """获取 aiocqhttp 客户端实例。"""
@@ -434,6 +479,17 @@ class BiliVerifyFeishuPlugin(Star):
 
     async def _on_group_request(self, event: AstrMessageEvent | None, raw: dict):
         """处理加群请求事件（request_type=group）。"""
+        # 防 gank：随机延迟后再处理，避免被批量请求打爆飞书限流
+        delay_min = self._safe_float(self._get_config("REQUEST_DELAY_MIN_SECONDS", 10.0), default=10.0, minimum=0.0)
+        delay_max = self._safe_float(self._get_config("REQUEST_DELAY_MAX_SECONDS", 60.0), default=60.0, minimum=0.0)
+        if delay_max < delay_min:
+            delay_max = delay_min
+        if delay_min > 0 or delay_max > 0:
+            delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
+            if delay > 0:
+                logger.debug(f"[BiliVerifyFeishu] 入群请求随机延迟 {delay:.2f}s: group={raw.get('group_id')}, user={raw.get('user_id')}")
+                await asyncio.sleep(delay)
+
         group_id = str(raw.get("group_id", ""))
         user_id = str(raw.get("user_id", ""))
         flag = str(raw.get("flag", "")).strip()
@@ -520,12 +576,15 @@ class BiliVerifyFeishuPlugin(Star):
                     "retry_count": 0,
                 }
             )
+            # 飞书不可达时不拒绝用户，先放行并入待处理队列，后续由巡检/重连扫描补偿
+            logger.warning(
+                f"[BiliVerifyFeishu] 飞书写入失败但仍放行用户，待后续补偿: UID={uid}, QQ={user_id}, 群={group_id}"
+            )
             await self._set_group_add_request(
                 event,
                 flag=flag,
                 sub_type=sub_type,
-                approve=False,
-                reason="验证登记失败，请稍后重试",
+                approve=True,
             )
 
     async def _on_member_increase(self, event: AstrMessageEvent, raw: dict):
@@ -677,6 +736,117 @@ class BiliVerifyFeishuPlugin(Star):
 
         return None
 
+    # ---- QQ 掉线检测（OneBot get_status + 飞书通知） ----
+
+    async def _is_qq_online(self) -> bool:
+        """通过 OneBot API 探测 QQ 是否在线。返回 True 表示在线。
+
+        依据 OneBot 11 协议文档:
+        - get_status 返回 {online: bool, good: bool}
+        - get_login_info 在离线时通常抛异常或返回空
+        同时兼容通过 aiocqhttp 底层 ws 客户端是否为空的前置判断。
+        """
+        client = self._get_aiocqhttp_client()
+        if client is None or not hasattr(client, "api"):
+            return False
+
+        try:
+            api_clients = getattr(client, "_wsr_api_clients", None)
+            event_clients = getattr(client, "_wsr_event_clients", None)
+            if isinstance(api_clients, dict) and isinstance(event_clients, set):
+                if not api_clients and not event_clients:
+                    return False
+        except Exception:
+            pass
+
+        try:
+            ret = await client.api.call_action("get_status")
+            payload = ret.get("data", ret) if isinstance(ret, dict) else ret
+            if isinstance(payload, dict):
+                if "online" in payload:
+                    return bool(payload.get("online")) and bool(payload.get("good", True))
+                if "good" in payload:
+                    return bool(payload.get("good"))
+                if "stat" in payload:
+                    return True
+                return True
+            return True
+        except Exception as e:
+            logger.debug(f"[BiliVerifyFeishu] get_status 探测失败: {e}")
+            return False
+
+    async def _offline_monitor_loop(self, interval_seconds: int):
+        """定时探测 QQ 在线状态，阈值触发后通过飞书通知，恢复后补偿扫描。"""
+        threshold = self._safe_int(self._get_config("OFFLINE_THRESHOLD", 3), default=3, minimum=1)
+        await asyncio.sleep(10)
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    online = await self._is_qq_online()
+                except Exception as e:
+                    logger.warning(f"[BiliVerifyFeishu] 掉线检测异常: {e}")
+                    online = False
+
+                if online:
+                    if self._offline_is_down:
+                        self._offline_is_down = False
+                        self._offline_fail_count = 0
+                        logger.info("[BiliVerifyFeishu] QQ已恢复在线，执行补偿扫描")
+                        if self._safe_bool(self._get_config("OFFLINE_RECOVERY_NOTIFY", True), default=True):
+                            await self._notify_recovery_via_feishu()
+                        # 补偿扫描掉线期间积压的加群请求
+                        try:
+                            limit = self._safe_int(self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50), default=50, minimum=1)
+                            await self._scan_unhandled_group_requests_on_startup(limit)
+                        except Exception as e:
+                            logger.warning(f"[BiliVerifyFeishu] 恢复后补偿扫描失败: {e}")
+                    else:
+                        self._offline_fail_count = 0
+                else:
+                    self._offline_fail_count += 1
+                    logger.warning(
+                        f"[BiliVerifyFeishu] QQ离线探测失败 {self._offline_fail_count}/{threshold}"
+                    )
+                    if self._offline_fail_count >= threshold and not self._offline_is_down:
+                        self._offline_is_down = True
+                        logger.error("[BiliVerifyFeishu] 判定QQ机器人掉线，将通过飞书通知")
+                        await self._notify_offline_via_feishu()
+        except asyncio.CancelledError:
+            logger.info("[BiliVerifyFeishu] QQ掉线检测任务已停止")
+            raise
+        except Exception as e:
+            logger.error(f"[BiliVerifyFeishu] 掉线检测任务异常退出: {e}")
+
+    async def _notify_offline_via_feishu(self):
+        """通过飞书发送掉线告警。"""
+        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        whitelist = load_whitelist()
+        pending_cnt = len([k for k in self._pending_uid if k.split(":", 1)[0] in set(whitelist)])
+        content = (
+            f"⚠️ QQ机器人掉线告警\n"
+            f"时间: {ts}\n"
+            f"连续失败: {self._offline_fail_count} 次\n"
+            f"白名单群: {len(whitelist)} 个\n"
+            f"待补UID: {pending_cnt} 条\n"
+            f"请检查 NapCat/OneBot 连接与网络。"
+        )
+        try:
+            sent = await broadcast_feishu_message(content=content, config=self.config)
+            if sent == 0:
+                logger.warning("[BiliVerifyFeishu] 飞书掉线告警未发送（无目标或失败），已记录日志")
+        except Exception as e:
+            logger.error(f"[BiliVerifyFeishu] 飞书掉线告警发送异常: {e}")
+
+    async def _notify_recovery_via_feishu(self):
+        """通过飞书发送恢复通知。"""
+        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        content = f"✅ QQ机器人已恢复在线\n时间: {ts}\n"
+        try:
+            await broadcast_feishu_message(content=content, config=self.config)
+        except Exception as e:
+            logger.error(f"[BiliVerifyFeishu] 飞书恢复通知发送异常: {e}")
+
     async def terminate(self):
         """插件销毁。"""
         if self._pending_check_task is not None:
@@ -686,4 +856,11 @@ class BiliVerifyFeishuPlugin(Star):
             except asyncio.CancelledError:
                 pass
             self._pending_check_task = None
+        if self._offline_monitor_task is not None:
+            self._offline_monitor_task.cancel()
+            try:
+                await self._offline_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._offline_monitor_task = None
         logger.info("[BiliVerifyFeishu] 插件已卸载")

@@ -83,5 +83,53 @@
     "type": "int",
     "default": 3800,
     "hint": "插件会按该间隔检查白名单群中的待补UID和写入失败记录，并输出告警日志。最小值为10秒。"
+  },
+  "ENABLE_OFFLINE_NOTIFY": {
+    "description": "是否启用QQ机器人掉线检测与飞书通知",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件将定时检测 OneBot 连接状态，判定掉线后通过飞书API通知指定用户。需配置飞书通知目标。"
+  },
+  "OFFLINE_FEISHU_TARGETS": {
+    "description": "飞书通知目标ID列表",
+    "type": "list",
+    "hint": "掉线时通过飞书私聊通知的用户ID列表。可填 open_id / user_id / union_id / email，类型由下方配置决定。需确保机器人有 im:message 权限且与目标有会话。",
+    "default": []
+  },
+  "OFFLINE_FEISHU_ID_TYPE": {
+    "description": "飞书目标ID类型",
+    "type": "string",
+    "hint": "对应 OFFLINE_FEISHU_TARGETS 的ID类型：open_id / user_id / union_id / email / chat_id",
+    "default": "open_id"
+  },
+  "OFFLINE_CHECK_INTERVAL": {
+    "description": "掉线检测间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "每隔该秒数调用 get_status 检查一次在线状态。最小值10秒，建议30-120秒。"
+  },
+  "OFFLINE_THRESHOLD": {
+    "description": "连续失败阈值",
+    "type": "int",
+    "default": 3,
+    "hint": "连续多少次检测失败才判定为掉线并通过飞书告警，避免网络抖动误报。最小值1。"
+  },
+  "OFFLINE_RECOVERY_NOTIFY": {
+    "description": "恢复上线时是否通过飞书通知",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后机器人从掉线恢复时也会通过飞书通知。"
+  },
+  "REQUEST_DELAY_MIN_SECONDS": {
+    "description": "收到入群请求后随机延迟最小值（秒）",
+    "type": "float",
+    "default": 10.0,
+    "hint": "为防止被批量请求 gank，处理每个入群请求前会随机延迟 min~max 秒。设为 0 则不延迟。默认 10 秒。"
+  },
+  "REQUEST_DELAY_MAX_SECONDS": {
+    "description": "收到入群请求后随机延迟最大值（秒）",
+    "type": "float",
+    "default": 60.0,
+    "hint": "与最小值配合形成随机区间，建议 10~60 秒。若最大值小于最小值则按最小值处理。"
   }
 }

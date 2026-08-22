@@ -520,6 +520,115 @@ async def update_member_status_by_qq_with_retry(
                 f"飞书状态更新失败，{delay:.1f}秒后进行第 {attempt + 2} 次重试..."
             )
             await asyncio.sleep(delay)
-
     logger.error(f"飞书状态更新失败，已重试 {_max_retries} 次, QQ={qq_num}")
     return False
+
+
+async def send_feishu_message(
+    content: str,
+    receive_id: str,
+    config: Mapping[str, Any],
+    receive_id_type: str = "open_id",
+    msg_type: str = "text",
+) -> bool:
+    """通过飞书开放 API (im/v1/messages) 发送私聊/群聊消息。
+
+    文档: https://open.feishu.cn/document/server-docs/im-v1/message/create
+    SDK: lark_oapi.api.im.v1.CreateMessageRequest / CreateMessageResponse
+    权限需求: im:message:send_as_bot (或 im:message)，且机器人与目标有会话。
+    """
+    import json as _json
+
+    receive_id = str(receive_id or "").strip()
+    receive_id_type = str(receive_id_type or "open_id").strip() or "open_id"
+    if not receive_id:
+        logger.warning("[FeishuMessage] 发送跳过: receive_id 为空")
+        return False
+
+    # 允许的 receive_id_type: open_id, user_id, union_id, email, chat_id
+    if receive_id_type not in {"open_id", "user_id", "union_id", "email", "chat_id"}:
+        logger.warning(f"[FeishuMessage] 未知的 receive_id_type={receive_id_type}，回退为 open_id")
+        receive_id_type = "open_id"
+
+    # 内容包装：text 类型需为 JSON 字符串 {"text": "..."}
+    if msg_type == "text":
+        text_content = _json.dumps({"text": str(content)}, ensure_ascii=False)
+    else:
+        text_content = str(content)
+
+    # 校验基础配置
+    app_id = str(config.get("FEISHU_APP_ID", "") or "").strip()
+    app_secret = str(config.get("FEISHU_APP_SECRET", "") or "").strip()
+    if not app_id or not app_secret:
+        logger.error("[FeishuMessage] 发送失败: FEISHU_APP_ID / FEISHU_APP_SECRET 未配置")
+        return False
+
+    client = _get_client(config)
+
+    try:
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+    except ImportError as e:
+        logger.error(f"[FeishuMessage] 导入飞书消息模型失败: {e}")
+        return False
+
+    request = (
+        CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(receive_id)
+            .msg_type(msg_type)
+            .content(text_content)
+            .build()
+        )
+        .build()
+    )
+
+    try:
+        await _acquire_rate_limit_slot()
+        # lark SDK 异步方法为 acreate
+        response = await client.im.v1.message.acreate(request)
+    except Exception as e:
+        logger.error(f"[FeishuMessage] 发送异常 receive_id={receive_id}: {e}")
+        return False
+
+    if not response.success():
+        logger.error(
+            f"[FeishuMessage] 发送失败 receive_id={receive_id}, "
+            f"code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+        )
+        return False
+
+    logger.info(f"[FeishuMessage] 发送成功 receive_id={receive_id}, type={receive_id_type}")
+    return True
+
+
+async def broadcast_feishu_message(
+    content: str,
+    config: Mapping[str, Any],
+) -> int:
+    """向 OFFLINE_FEISHU_TARGETS 配置的所有目标广播同一条消息。返回成功数。"""
+    raw_targets = config.get("OFFLINE_FEISHU_TARGETS", [])
+    id_type = str(config.get("OFFLINE_FEISHU_ID_TYPE", "open_id") or "open_id").strip() or "open_id"
+
+    targets: list[str] = []
+    if isinstance(raw_targets, list):
+        targets = [str(t).strip() for t in raw_targets if str(t).strip()]
+    elif isinstance(raw_targets, str) and raw_targets.strip():
+        targets = [p.strip() for p in raw_targets.split(",") if p.strip()]
+
+    if not targets:
+        logger.warning("[FeishuMessage] 未配置 OFFLINE_FEISHU_TARGETS，跳过飞书通知")
+        return 0
+
+    success = 0
+    for tid in targets:
+        ok = await send_feishu_message(
+            content=content,
+            receive_id=tid,
+            config=config,
+            receive_id_type=id_type,
+        )
+        if ok:
+            success += 1
+    return success
