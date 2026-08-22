@@ -131,5 +131,23 @@
     "type": "float",
     "default": 60.0,
     "hint": "与最小值配合形成随机区间，建议 10~60 秒。若最大值小于最小值则按最小值处理。"
+  },
+  "ENABLE_QQOFFICIAL_JOIN_POLL": {
+    "description": "是否启用QQ官方入群申请轮询（需主动拉取）",
+    "type": "bool",
+    "default": true,
+    "hint": "qq_official 官方文档要求轮询 /v2/groups/{group_openid}/join_request_list，关闭后将不再拉取入群申请（官方群消息仍受群@限制）"
+  },
+  "QQOFFICIAL_POLL_INTERVAL": {
+    "description": "QQ官方入群申请轮询间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "每隔该秒数拉取一次白名单群的入群申请列表，接口限频 30QPM，建议 30-60 秒，最小 10 秒"
+  },
+  "QQOFFICIAL_POLL_LIMIT": {
+    "description": "单次轮询拉取条数",
+    "type": "int",
+    "default": 20,
+    "hint": "GET join_request_list 的 limit 参数，默认 20，最大 100"
   }
 }
