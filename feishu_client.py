@@ -261,11 +261,11 @@ def _first_record_id_from_search_response(response: SearchAppTableRecordResponse
 
 
 async def _find_record_id_by_qq(
-    qq_num: int,
+    qq_num: int | str,
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
 ) -> tuple[bool, str]:
-    """按 QQ 查询首条记录，返回(查询成功, record_id)。"""
+    """按 QQ 查询首条记录，返回(查询成功, record_id)。兼容数字 QQ 与 qq_official 的 openid 字符串。"""
     app_token, table_id = _normalize_bitable_ids(
         config.get("FEISHU_APP_TOKEN", ""),
         config.get("FEISHU_TABLE_ID", ""),
@@ -276,13 +276,20 @@ async def _find_record_id_by_qq(
 
     qq_field = str(qq_field_name).strip() or "QQ号"
     client = _get_client(config)
+    # 兼容 openid 字符串：飞书侧字段若为文本类型需传字符串，若为数字类型则传 int
+    qq_value: int | str = qq_num
+    if isinstance(qq_num, str) and qq_num.isdigit():
+        try:
+            qq_value = int(qq_num)
+        except ValueError:
+            qq_value = qq_num
     filter_payload = {
         "conjunction": "and",
         "conditions": [
             {
                 "field_name": qq_field,
                 "operator": "is",
-                "value": [qq_num],
+                "value": [qq_value],
             }
         ],
     }
@@ -323,11 +330,11 @@ async def _find_record_id_by_qq(
 
 async def upsert_member_row_by_qq(
     fields: dict,
-    qq_num: int,
+    qq_num: int | str,
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
 ) -> bool:
-    """按 QQ 先查后写：命中则更新，未命中则新增。"""
+    """按 QQ 先查后写：命中则更新，未命中则新增。兼容 openid 字符串。"""
     found_ok, record_id = await _find_record_id_by_qq(
         qq_num=qq_num,
         config=config,
@@ -380,13 +387,13 @@ async def upsert_member_row_by_qq(
 
 async def upsert_member_row_by_qq_with_retry(
     fields: dict,
-    qq_num: int,
+    qq_num: int | str,
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
     max_retries: int | None = None,
     retry_delay: float | None = None,
 ) -> bool:
-    """按 QQ 先查后写，失败时指数退避重试。"""
+    """按 QQ 先查后写，失败时指数退避重试。兼容 openid。"""
     _max_retries: int = _safe_int(
         max_retries if max_retries is not None else config.get("MAX_RETRIES", 3),
         default=3,
@@ -420,13 +427,13 @@ async def upsert_member_row_by_qq_with_retry(
 
 
 async def update_member_status_by_qq(
-    qq_num: int,
+    qq_num: int | str,
     status_value: str,
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
     status_field_name: str = "状态",
 ) -> bool:
-    """按 QQ 号查找并更新成员状态字段。"""
+    """按 QQ 号查找并更新成员状态字段。兼容 openid。"""
     found_ok, record_id = await _find_record_id_by_qq(
         qq_num=qq_num,
         config=config,
@@ -483,7 +490,7 @@ async def update_member_status_by_qq(
 
 
 async def update_member_status_by_qq_with_retry(
-    qq_num: int,
+    qq_num: int | str,
     status_value: str,
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
@@ -491,7 +498,7 @@ async def update_member_status_by_qq_with_retry(
     max_retries: int | None = None,
     retry_delay: float | None = None,
 ) -> bool:
-    """按 QQ 更新成员状态，失败时指数退避重试。"""
+    """按 QQ 更新成员状态，失败时指数退避重试。兼容 openid。"""
     _max_retries: int = _safe_int(
         max_retries if max_retries is not None else config.get("MAX_RETRIES", 3),
         default=3,
