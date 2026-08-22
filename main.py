@@ -1155,41 +1155,58 @@ class BiliVerifyFeishuPlugin(Star):
             logger.error(f"[BiliVerifyFeishu] QQ官方入群轮询异常退出: {e}")
 
     @staticmethod
-    def _is_valid_group_openid(g: str) -> bool:
-        """判断是否为合法的 qq_official group_openid。
+    def _normalize_group_openid(g: str) -> str:
+        """归一化白名单项为可请求的 qq_official group_openid。
 
-        官方 group_openid 为大写十六进制风格字符串（如 6CCC18AB28098F241B44FF1A41F6668F）。
-        - 纯数字（aiocqhttp 群号）→ 不适用于官方接口
-        - 含 ':' 或为 UMO 全串（default_xxx:GroupMessage:xxx）→ 不适用
-        - 过短/含非法字符 → 视为无效
+        兼容三种写法：
+        - 纯 group_openid：6CCC18AB28098F241B44FF1A41F6668F
+        - UMO 全串：default_1905473952:GroupMessage:6CCC18AB28098F241B44FF1A41F6668F
+          （取最后一段 Session ID）
+        - aiocqhttp 数字群号：1048195177 → 返回空串，由调用方跳过
+
+        官方接口只认 group_openid；数字群号属 OneBot 语义，无法转官方 openid。
         """
         s = str(g or "").strip()
-        if not s or ":" in s:
-            return False
+        if not s:
+            return ""
+        # UMO 全串：取 ':' 分隔的最后一段作为 Session ID
+        if ":" in s:
+            s = s.rsplit(":", 1)[-1].strip()
+        if not s:
+            return ""
+        # 数字群号是 OneBot 语义，官方接口不可用
         if s.isdigit():
-            return False
-        # 官方 openid 常见长度 32；放宽为 16-64 的大写十六进制
+            return ""
+        # 长度/字符宽松校验（官方 openid 为大写十六进制风格，长度常见 32）
         if not (8 <= len(s) <= 128):
-            return False
-        return True
+            return ""
+        return s
 
     async def _poll_qqofficial_join_requests_once(self):
-        """单次轮询所有白名单群的入群申请。自动过滤非 qq_official 的白名单项与已知无效群。"""
+        """单次轮询所有白名单群的入群申请。
+
+        白名单项自动归一化：支持纯 group_openid、UMO 全串、数字群号混写。
+        - UMO 全串 → 取 Session ID 段请求官方接口
+        - 数字群号 → 跳过（OneBot 语义）
+        - 已知无效/不可达群 → 缓存跳过
+        """
         whitelist = load_whitelist()
         if not whitelist:
             return
+        seen: set[str] = set()
         # 频率控制：每个群间隔约 0.5s，避免触发 30QPM 限制
         for group_openid in whitelist:
-            g = str(group_openid).strip()
+            raw_entry = str(group_openid).strip()
+            g = self._normalize_group_openid(raw_entry)
             if not g:
+                if raw_entry and raw_entry not in self._qqofficial_invalid_groups:
+                    logger.debug(f"[BiliVerifyFeishu] 跳过非 qq_official 白名单项: {raw_entry}")
                 continue
-            # 过滤：非官方 openid 格式 或 已知无效/不可达
             if g in self._qqofficial_invalid_groups:
                 continue
-            if not self._is_valid_group_openid(g):
-                logger.debug(f"[BiliVerifyFeishu] 跳过非 qq_official 白名单项: {g}")
-                self._qqofficial_invalid_groups.add(g)
-                continue
+            if g in seen:
+                continue  # 同一 openid 多条白名单项只拉一次
+            seen.add(g)
             try:
                 await self._poll_single_group_join_requests(g)
             except Exception as e:
