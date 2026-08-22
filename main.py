@@ -26,7 +26,7 @@ from .storage import (
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.0.3",
+    "0.0.4",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -42,6 +42,8 @@ class BiliVerifyFeishuPlugin(Star):
         self._verified_before_join: set[str] = set()
         self._processed_request_keys: set[str] = set()
         self._pending_check_task: asyncio.Task | None = None
+        # QQ 官方入群申请轮询
+        self._qqofficial_poll_task: asyncio.Task | None = None
         # QQ 掉线检测（通过飞书通知）
         self._offline_monitor_task: asyncio.Task | None = None
         self._offline_fail_count: int = 0
@@ -157,6 +159,24 @@ class BiliVerifyFeishuPlugin(Star):
             )
         else:
             logger.info("[BiliVerifyFeishu] 未处理入群请求巡检已关闭")
+
+        # 启动 QQ 官方入群申请轮询（需主动拉取，官方文档要求轮询）
+        enable_qq_poll = self._safe_bool(
+            self._get_config("ENABLE_QQOFFICIAL_JOIN_POLL", True),
+            default=True,
+        )
+        if enable_qq_poll:
+            poll_interval = self._safe_int(
+                self._get_config("QQOFFICIAL_POLL_INTERVAL", 30),
+                default=30,
+                minimum=10,
+            )
+            self._qqofficial_poll_task = asyncio.create_task(
+                self._qqofficial_join_poll_loop(poll_interval)
+            )
+            logger.info(f"[BiliVerifyFeishu] 已启动QQ官方入群申请轮询，间隔: {poll_interval}s（仅 qq_official 生效，aiocqhttp 下空转）")
+        else:
+            logger.info("[BiliVerifyFeishu] QQ官方入群申请轮询已关闭")
 
         # 启动 QQ 掉线检测（飞书通知）
         enable_offline = self._safe_bool(
@@ -1058,6 +1078,296 @@ class BiliVerifyFeishuPlugin(Star):
         except Exception as e:
             logger.error(f"[BiliVerifyFeishu] 飞书恢复通知发送异常: {e}")
 
+    # ---- QQ 官方入群申请轮询（主动拉取） ----
+    async def _qqofficial_join_poll_loop(self, interval_seconds: int):
+        """定时轮询 qq_official 入群申请列表。"""
+        # 等待适配器就绪
+        for _ in range(6):
+            await asyncio.sleep(1)
+            if self._get_qqofficial_client() is not None:
+                break
+        await asyncio.sleep(5)
+        logger.info("[BiliVerifyFeishu] QQ官方入群申请轮询已就绪，开始首次拉取")
+        try:
+            while True:
+                try:
+                    await self._poll_qqofficial_join_requests_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[BiliVerifyFeishu] QQ官方入群轮询异常: {e}")
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            logger.info("[BiliVerifyFeishu] QQ官方入群申请轮询已停止")
+            raise
+        except Exception as e:
+            logger.error(f"[BiliVerifyFeishu] QQ官方入群轮询异常退出: {e}")
+
+    async def _poll_qqofficial_join_requests_once(self):
+        """单次轮询所有白名单群的入群申请。"""
+        whitelist = load_whitelist()
+        if not whitelist:
+            return
+        # 频率控制：每个群间隔约 0.5s，避免触发 30QPM 限制
+        for group_openid in whitelist:
+            g = str(group_openid).strip()
+            if not g:
+                continue
+            try:
+                await self._poll_single_group_join_requests(g)
+            except Exception as e:
+                logger.debug(f"[BiliVerifyFeishu] 拉取群 {g} 入群申请失败: {e}")
+            await asyncio.sleep(0.5)
+
+    async def _poll_single_group_join_requests(self, group_openid: str):
+        """拉取单个群的入群申请并处理。"""
+        client = self._get_qqofficial_client()
+        if client is None:
+            logger.debug("[BiliVerifyFeishu] 无法获取 qq_official 客户端，跳过轮询")
+            return
+        # 兼容 botpy 版本差异：优先使用 BotAPI._http.request + Route
+        try:
+            from botpy.http import Route
+        except Exception:
+            logger.warning("[BiliVerifyFeishu] 未找到 botpy.http.Route，跳过QQ官方拉取")
+            return
+
+        http = getattr(getattr(client, "api", None), "_http", None)
+        if http is None:
+            # 兜底：client 本身可能就是 http
+            http = getattr(client, "_http", None)
+        if http is None:
+            logger.warning("[BiliVerifyFeishu] 无法获取 qq_official http 客户端")
+            return
+
+        poll_limit = self._safe_int(self._get_config("QQOFFICIAL_POLL_LIMIT", 20), default=20, minimum=1)
+        poll_limit = min(poll_limit, 100)
+        cursor = ""
+        # 随机延迟复用现有配置，防 gank
+        delay_min = self._safe_float(self._get_config("REQUEST_DELAY_MIN_SECONDS", 0), default=0, minimum=0.0)
+        delay_max = self._safe_float(self._get_config("REQUEST_DELAY_MAX_SECONDS", 0), default=0, minimum=0.0)
+        # 限制单次轮询最大页数防止死循环
+        max_pages = 5
+        pages = 0
+        while pages < max_pages:
+            pages += 1
+            route = Route("GET", "/v2/groups/{group_openid}/join_request_list", group_openid=group_openid)
+            # 请求参数：cursor/limit 官方文档定义在请求体，但 botpy 的 GET 需用 params
+            params: dict[str, str | int] = {}
+            if cursor:
+                params["cursor"] = cursor
+            if poll_limit:
+                params["limit"] = poll_limit
+            try:
+                # botpy 的 request 支持 params 关键字
+                if params:
+                    ret = await http.request(route, params=params)
+                else:
+                    ret = await http.request(route)
+            except TypeError:
+                # 兼容旧版 botpy 仅支持 json 参数的场景
+                try:
+                    ret = await http.request(route, json=params if params else None)
+                except Exception as e:
+                    logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {e}")
+                    return
+            except Exception as e:
+                logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {e}")
+                return
+
+            if ret is None:
+                return
+            # 兼容部分实现返回 {data: {...}} 包裹
+            payload = ret.get("data", ret) if isinstance(ret, dict) else ret
+            if not isinstance(payload, dict):
+                return
+            req_list = payload.get("list", []) or []
+            next_cursor = str(payload.get("next_cursor", "") or "").strip()
+
+            if not req_list:
+                # 无待处理
+                if not next_cursor:
+                    return
+                cursor = next_cursor
+                continue
+
+            for item in req_list:
+                if not isinstance(item, dict):
+                    continue
+                join_request_id = str(item.get("join_request_id", "")).strip()
+                member_openid = str(item.get("member_openid", "")).strip()
+                username = str(item.get("username", "")).strip()
+                if not join_request_id or not member_openid:
+                    continue
+                # 去重：join_request_id 维度
+                req_key = f"{group_openid}:{member_openid}:{join_request_id}"
+                if req_key in self._processed_request_keys:
+                    continue
+                self._processed_request_keys.add(req_key)
+
+                # 提取校验信息：verify_message 或 review_qa_list
+                verify_info = item.get("verify_info", {}) if isinstance(item.get("verify_info", {}), dict) else {}
+                comment = str(verify_info.get("verify_message", "") or "").strip()
+                if not comment:
+                    # 兼容问答模式：拼接所有答案
+                    qa_list = verify_info.get("review_qa_list", []) or []
+                    if isinstance(qa_list, list):
+                        parts = []
+                        for qa in qa_list:
+                            if isinstance(qa, dict):
+                                ans = str(qa.get("answer", "") or "").strip()
+                                if ans:
+                                    parts.append(ans)
+                        comment = " ".join(parts)
+
+                # 防 gank 随机延迟
+                if delay_min > 0 or delay_max > 0:
+                    dm = delay_min
+                    dx = delay_max
+                    if dx < dm:
+                        dx = dm
+                    delay = random.uniform(dm, dx) if dx > dm else dm
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                await self._handle_qqofficial_join_request(
+                    group_openid=group_openid,
+                    member_openid=member_openid,
+                    join_request_id=join_request_id,
+                    username=username,
+                    comment=comment,
+                    raw_item=item,
+                )
+
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    async def _handle_qqofficial_join_request(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str,
+        username: str,
+        comment: str,
+        raw_item: dict,
+    ):
+        """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。"""
+        if not is_group_whitelisted(group_openid):
+            logger.info(f"[BiliVerifyFeishu] 非白名单群入群申请，忽略: group={group_openid}, user={member_openid}")
+            return
+
+        uid = self._extract_uid(comment)
+        if uid is None:
+            logger.info(
+                f"[BiliVerifyFeishu] 捕获白名单群入群请求但无有效UID，拒绝: group={group_openid}, user={member_openid}({username}), comment={comment!r}"
+            )
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=False,
+                reject_reason="请在入群验证信息中提供B站UID",
+            )
+            return
+
+        uid_num = int(uid)
+        qq_key: int | str = member_openid
+        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        nickname = username or await self._resolve_nickname(user_id=member_openid, event=None, raw=raw_item)
+
+        fields = self._build_fields_for_join(
+            uid_num=uid_num,
+            qq_num=qq_key,
+            nickname=nickname,
+            time_ms=time_ms,
+        )
+
+        success = await upsert_member_row_by_qq_with_retry(
+            fields=fields,
+            qq_num=qq_key,
+            config=self.config,
+            qq_field_name="QQ号",
+        )
+        if success:
+            logger.info(f"[BiliVerifyFeishu] QQ官方入群 UID 写入成功，准备放行: UID={uid}, openid={member_openid}, 群={group_openid}")
+            self._verified_before_join.add(f"{group_openid}:{member_openid}")
+            self._pending_uid.discard(f"{group_openid}:{member_openid}")
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=True,
+            )
+        else:
+            logger.error(f"[BiliVerifyFeishu] QQ官方入群 UID 写入失败，已加入待处理: UID={uid}, openid={member_openid}")
+            add_to_pending(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "group_id": group_openid,
+                    "user_id": member_openid,
+                    "uid": uid,
+                    "nickname": nickname,
+                    "retry_count": 0,
+                    "join_request_id": join_request_id,
+                }
+            )
+            logger.warning(f"[BiliVerifyFeishu] 飞书写入失败但仍放行（qq_official）: UID={uid}, openid={member_openid}")
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=True,
+            )
+
+    async def _qqofficial_approve_join_request(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str,
+        approve: bool,
+        reject_reason: str = "",
+    ) -> bool:
+        """调用官方审批接口。"""
+        client = self._get_qqofficial_client()
+        if client is None:
+            logger.error("[BiliVerifyFeishu] 审批失败: 无法获取 qq_official 客户端")
+            return False
+        try:
+            from botpy.http import Route
+        except Exception:
+            logger.error("[BiliVerifyFeishu] 审批失败: 未找到 botpy.http.Route")
+            return False
+        http = getattr(getattr(client, "api", None), "_http", None)
+        if http is None:
+            http = getattr(client, "_http", None)
+        if http is None:
+            logger.error("[BiliVerifyFeishu] 审批失败: 无法获取 http 客户端")
+            return False
+
+        route = Route(
+            "POST",
+            "/v2/groups/{group_openid}/approval_join_request/{member_openid}",
+            group_openid=group_openid,
+            member_openid=member_openid,
+        )
+        payload: dict[str, str | bool] = {
+            "op": "approve" if approve else "decline",
+            "join_request_id": join_request_id,
+        }
+        if not approve and reject_reason:
+            payload["reject_reason"] = reject_reason
+
+        try:
+            ret = await http.request(route, json=payload)
+            logger.info(
+                f"[BiliVerifyFeishu] 已处理QQ官方入群申请: approve={approve}, group={group_openid}, member={member_openid}, ret={ret}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[BiliVerifyFeishu] 处理QQ官方入群申请失败: {e}")
+            return False
+
     async def terminate(self):
         """插件销毁。"""
         if self._pending_check_task is not None:
@@ -1067,6 +1377,13 @@ class BiliVerifyFeishuPlugin(Star):
             except asyncio.CancelledError:
                 pass
             self._pending_check_task = None
+        if self._qqofficial_poll_task is not None:
+            self._qqofficial_poll_task.cancel()
+            try:
+                await self._qqofficial_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._qqofficial_poll_task = None
         if self._offline_monitor_task is not None:
             self._offline_monitor_task.cancel()
             try:
