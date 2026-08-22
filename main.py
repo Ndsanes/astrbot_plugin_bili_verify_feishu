@@ -26,7 +26,7 @@ from .storage import (
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.0.2",
+    "0.0.3",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -241,18 +241,40 @@ class BiliVerifyFeishuPlugin(Star):
             logger.debug(f"[BiliVerifyFeishu] 周期补偿扫描失败: {e}")
 
     def _get_aiocqhttp_client(self, event: AstrMessageEvent | None = None):
-        """获取 aiocqhttp 客户端实例。"""
+        """获取 aiocqhttp 客户端实例。兼容旧调用入口。"""
+        return self._get_platform_client(filter.PlatformAdapterType.AIOCQHTTP, event)
+
+    def _get_platform_client(self, platform_type, event: AstrMessageEvent | None = None):
+        """按平台类型获取客户端，兼容 aiocqhttp / qq_official。"""
+        # 1) 事件上直接携带的 bot（AstrMessageEvent.bot）
         client = getattr(event, "bot", None) if event is not None else None
         if client is not None:
             return client
-
         try:
-            platform = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+            platform = self.context.get_platform(platform_type)
             if platform is not None and hasattr(platform, "get_client"):
                 return platform.get_client()
         except Exception:
             return None
         return None
+
+    def _get_qqofficial_client(self, event: AstrMessageEvent | None = None):
+        """获取 qq_official 客户端（botpy.Client）。"""
+        return self._get_platform_client(filter.PlatformAdapterType.QQOFFICIAL, event)
+
+    def _has_platform(self, platform_type) -> bool:
+        """检查指定平台是否已在 AstrBot 中注册。"""
+        try:
+            platform = self.context.get_platform(platform_type)
+            return platform is not None
+        except Exception:
+            return False
+
+    def _has_aiocqhttp(self) -> bool:
+        return self._has_platform(filter.PlatformAdapterType.AIOCQHTTP)
+
+    def _has_qqofficial(self) -> bool:
+        return self._has_platform(filter.PlatformAdapterType.QQOFFICIAL)
 
     def _extract_group_requests_from_system_msg(self, payload: Any) -> list[dict]:
         """从 get_group_system_msg 返回值中提取请求列表。"""
@@ -291,42 +313,66 @@ class BiliVerifyFeishuPlugin(Star):
         event: AstrMessageEvent | None = None,
         raw: dict | None = None,
     ) -> str:
-        """解析用户昵称：优先事件/原始字段，兜底查询 OneBot 陌生人信息。"""
+        """解析用户昵称：优先事件/原始字段，兜底查询。兼容 aiocqhttp 与 qq_official。"""
+        # qq_official 路径：优先从 AstrMessageEvent 拿
+        if event is not None:
+            try:
+                name = event.get_sender_name()
+                if name and str(name).strip():
+                    return str(name).strip()
+                # AstrBotMessage.sender.nickname 可能在 message_obj 中
+                sender = getattr(event.message_obj, "sender", None)
+                if sender is not None:
+                    nick = getattr(sender, "nickname", "") or getattr(sender, "name", "")
+                    if nick and str(nick).strip():
+                        return str(nick).strip()
+            except Exception:
+                pass
+
         if raw is None:
             raw = {}
 
-        # 1) 常见上报字段优先
-        sender = raw.get("sender", {}) if isinstance(raw.get("sender", {}), dict) else {}
-        for value in (
-            sender.get("card"),
-            sender.get("nickname"),
-            raw.get("nickname"),
-            raw.get("requester_nick"),
-            raw.get("requester_nickname"),
-            raw.get("user_name"),
-            raw.get("nick"),
-        ):
-            text = str(value or "").strip()
-            if text:
-                return text
+        if isinstance(raw, dict):
+            sender = raw.get("sender", {}) if isinstance(raw.get("sender", {}), dict) else {}
+            for value in (
+                sender.get("card"),
+                sender.get("nickname"),
+                raw.get("nickname"),
+                raw.get("requester_nick"),
+                raw.get("requester_nickname"),
+                raw.get("user_name"),
+                raw.get("nick"),
+            ):
+                text = str(value or "").strip()
+                if text:
+                    return text
+            # 兼容部分 qq_official 原始对象可能携带 author 字段
+            for key in ("author", "member"):
+                obj = raw.get(key)
+                if isinstance(obj, dict):
+                    for v in (obj.get("username"), obj.get("nick"), obj.get("name")):
+                        if v and str(v).strip():
+                            return str(v).strip()
 
-        # 2) 兜底调用 OneBot 获取陌生人昵称
+        # OneBot 兜底：get_stranger_info（仅 aiocqhttp）
         client = self._get_aiocqhttp_client(event)
-        if client is None or not hasattr(client, "api"):
-            return ""
-
-        try:
-            ret = await client.api.call_action("get_stranger_info", user_id=int(user_id))
-        except Exception:
-            return ""
-
-        payload = ret.get("data", ret) if isinstance(ret, dict) else {}
-        if not isinstance(payload, dict):
-            return ""
-        return str(payload.get("nickname", "")).strip()
+        if client is not None and hasattr(client, "api"):
+            try:
+                # openid 非数字时跳过
+                if str(user_id).isdigit():
+                    ret = await client.api.call_action("get_stranger_info", user_id=int(user_id))
+                    payload = ret.get("data", ret) if isinstance(ret, dict) else {}
+                    if isinstance(payload, dict):
+                        return str(payload.get("nickname", "")).strip()
+            except Exception:
+                return ""
+        return 
 
     async def _deferred_startup_scan(self, limit: int):
-        """延迟执行启动补偿扫描，等待平台适配器就绪。"""
+        """延迟执行启动补偿扫描，等待平台适配器就绪。仅 aiocqhttp 支持。"""
+        if not self._has_aiocqhttp():
+            logger.info("[BiliVerifyFeishu] 未检测到 aiocqhttp 平台，跳过启动补偿扫描（qq_official 不支持入群审批）")
+            return
         for _ in range(6):
             await asyncio.sleep(1)
             client = self._get_aiocqhttp_client()
@@ -335,7 +381,10 @@ class BiliVerifyFeishuPlugin(Star):
         await self._scan_unhandled_group_requests_on_startup(limit)
 
     async def _scan_unhandled_group_requests_on_startup(self, limit: int):
-        """启动时补偿扫描未处理加群请求（覆盖插件加载前的请求）。"""
+        """启动时补偿扫描未处理加群请求（覆盖插件加载前的请求）。仅 aiocqhttp 支持。"""
+        if not self._has_aiocqhttp():
+            logger.info("[BiliVerifyFeishu] 当前为 qq_official 模式，无需补偿扫描")
+            return
         client = self._get_aiocqhttp_client()
         if client is None or not hasattr(client, "api"):
             logger.warning("[BiliVerifyFeishu] 启动补偿扫描失败: 无法获取 aiocqhttp 客户端")
@@ -397,12 +446,41 @@ class BiliVerifyFeishuPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_group_event(self, event: AstrMessageEvent):
-        """处理 OneBot 消息、通知与请求事件。"""
-        if event.get_platform_name() != "aiocqhttp":
+        """处理群事件：兼容 aiocqhttp (OneBot) 与 qq_official (官方 WS)。"""
+        platform_name = event.get_platform_name()
+        raw = event.message_obj.raw_message
+
+        # ---- QQ 官方机器人 (qq_official websocket) ----
+        if platform_name == "qq_official":
+            # 官方机器人仅支持群 @消息 / 私聊，无法拦截入群请求与成员增减
+            # 入群后用户在群内发送 UID 即触发登记
+            # AstrBot 已将 qq_official 的群消息映射为 GROUP_MESSAGE
+            try:
+                msg_type = event.message_obj.type
+                from astrbot.api.platform import MessageType as _MT
+                is_group = (msg_type == _MT.GROUP_MESSAGE)
+            except Exception:
+                is_group = True  # 兜底按群消息处理
+            # 无 raw dict 时直接按群消息处理
+            if raw is None:
+                await self._on_group_message_qq_official(event)
+                return
+            # 若 raw 为 botpy 对象，转为群消息处理
+            if not isinstance(raw, dict):
+                await self._on_group_message_qq_official(event)
+                return
+            # 兼容极少数情况下 raw 仍为 dict 的场景
+            await self._on_group_message_qq_official(event)
             return
 
-        raw = event.message_obj.raw_message
+        # ---- OneBot (aiocqhttp) ----
+        if platform_name != "aiocqhttp":
+            return
+
         if raw is None:
+            return
+        # 兼容 raw 可能是非 dict（如对象）的防御
+        if not isinstance(raw, dict):
             return
         post_type = raw.get("post_type")
 
@@ -429,15 +507,22 @@ class BiliVerifyFeishuPlugin(Star):
     def _build_fields_for_join(
         self,
         uid_num: int,
-        qq_num: int,
+        qq_num: int | str,
         nickname: str,
         time_ms: int,
     ) -> dict[str, Any]:
-        """构造入群登记写入字段，包含成员状态。"""
+        """构造入群登记写入字段，包含成员状态。兼容 qq_official 的 openid 字符串。"""
         status_field, active_value, _ = self._get_status_config()
+        # QQ号字段：数字保持 int，openid 字符串保持 str
+        qq_value: int | str = qq_num
+        if isinstance(qq_num, str) and qq_num.isdigit():
+            try:
+                qq_value = int(qq_num)
+            except ValueError:
+                qq_value = qq_num
         return {
             "UID": uid_num,
-            "QQ号": qq_num,
+            "QQ号": qq_value,
             "昵称": nickname,
             "时间": time_ms,
             status_field: active_value,
@@ -530,20 +615,26 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         uid_num = int(uid)
-        qq_num = int(user_id)
+        # 兼容 openid 字符串
+        qq_key: int | str = user_id
+        if isinstance(user_id, str) and user_id.isdigit():
+            try:
+                qq_key = int(user_id)
+            except ValueError:
+                qq_key = user_id
         time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         nickname = await self._resolve_nickname(user_id=user_id, event=event, raw=raw)
 
         fields = self._build_fields_for_join(
             uid_num=uid_num,
-            qq_num=qq_num,
+            qq_num=qq_key,
             nickname=nickname,
             time_ms=time_ms,
         )
 
         success = await upsert_member_row_by_qq_with_retry(
             fields=fields,
-            qq_num=qq_num,
+            qq_num=qq_key,
             config=self.config,
             qq_field_name="QQ号",
         )
@@ -621,17 +712,17 @@ class BiliVerifyFeishuPlugin(Star):
         self._pending_uid.discard(key)
         self._verified_before_join.discard(key)
 
-        try:
-            qq_num = int(user_id)
-        except ValueError:
-            logger.warning(
-                f"[BiliVerifyFeishu] 退群事件 user_id 非数字，跳过状态回写: {user_id}"
-            )
-            return
+        # 兼容 qq_official 的 openid 字符串：不再强制要求数字
+        qq_key: int | str = user_id
+        if isinstance(user_id, str) and user_id.isdigit():
+            try:
+                qq_key = int(user_id)
+            except ValueError:
+                qq_key = user_id
 
         status_field, _, left_value = self._get_status_config()
         success = await update_member_status_by_qq_with_retry(
-            qq_num=qq_num,
+            qq_num=qq_key,
             status_value=left_value,
             config=self.config,
             qq_field_name="QQ号",
@@ -650,11 +741,19 @@ class BiliVerifyFeishuPlugin(Star):
             )
 
     async def _on_group_message(self, event: AstrMessageEvent, raw: dict):
-        """处理群聊消息，提取 B站 UID 并写入飞书。"""
-        group_id = str(raw.get("group_id", ""))
+        """处理群聊消息，提取 B站 UID 并写入飞书。（aiocqhttp 路径，需 pending 校验）"""
+        # 兼容 raw 丢失或字段名差异：优先 event.get_group_id()
+        group_id = ""
+        if isinstance(raw, dict):
+            group_id = str(raw.get("group_id", "")).strip()
+        if not group_id:
+            try:
+                group_id = str(event.get_group_id() or "").strip()
+            except Exception:
+                group_id = ""
         user_id = str(event.get_sender_id())
 
-        if not is_group_whitelisted(group_id):
+        if not group_id or not is_group_whitelisted(group_id):
             return
 
         key = f"{group_id}:{user_id}"
@@ -677,13 +776,18 @@ class BiliVerifyFeishuPlugin(Star):
         )
 
         uid_num = int(uid)
-        qq_num = int(user_id)
+        qq_key2: int | str = user_id
+        if isinstance(user_id, str) and user_id.isdigit():
+            try:
+                qq_key2 = int(user_id)
+            except ValueError:
+                qq_key2 = user_id
         time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         # 构造写入飞书的字段数据
         fields = self._build_fields_for_join(
             uid_num=uid_num,
-            qq_num=qq_num,
+            qq_num=qq_key2,
             nickname=nickname,
             time_ms=time_ms,
         )
@@ -691,7 +795,7 @@ class BiliVerifyFeishuPlugin(Star):
         # 写入飞书（带重试）
         success = await upsert_member_row_by_qq_with_retry(
             fields=fields,
-            qq_num=qq_num,
+            qq_num=qq_key2,
             config=self.config,
             qq_field_name="QQ号",
         )
@@ -703,6 +807,87 @@ class BiliVerifyFeishuPlugin(Star):
                 f"[BiliVerifyFeishu] 飞书写入失败，已加入待处理队列: UID={uid}, QQ={user_id}"
             )
             # 写入失败时加入待处理队列
+            add_to_pending(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "uid": uid,
+                    "nickname": nickname,
+                    "retry_count": 0,
+                }
+            )
+
+    async def _on_group_message_qq_official(self, event: AstrMessageEvent):
+        """处理 qq_official 群消息：无 pending 限制，直接提取 UID 并写入飞书。"""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+        except Exception:
+            group_id = ""
+        if not group_id:
+            try:
+                group_id = str(getattr(event.message_obj, "group_id", "") or "").strip()
+            except Exception:
+                group_id = ""
+        if not group_id or not is_group_whitelisted(group_id):
+            return
+
+        user_id = str(event.get_sender_id() or "").strip()
+        if not user_id:
+            return
+
+        text = (event.message_str or "").strip()
+        if not text:
+            try:
+                raw = event.message_obj.raw_message
+                if raw is not None and hasattr(raw, "content"):
+                    text = str(getattr(raw, "content", "") or "").strip()
+            except Exception:
+                pass
+        if not text:
+            return
+
+        uid = self._extract_uid(text)
+        if uid is None:
+            return
+
+        key = f"{group_id}:{user_id}"
+        self._pending_uid.discard(key)
+
+        nickname = await self._resolve_nickname(user_id=user_id, event=event, raw=None)
+        logger.info(
+            f"[BiliVerifyFeishu][qq_official] 提取到 UID: {uid}, 用户: {user_id}({nickname}), 群: {group_id}"
+        )
+
+        uid_num = int(uid)
+        qq_key: int | str = user_id
+        if user_id.isdigit():
+            try:
+                qq_key = int(user_id)
+            except ValueError:
+                qq_key = user_id
+        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        fields = self._build_fields_for_join(
+            uid_num=uid_num,
+            qq_num=qq_key,
+            nickname=nickname,
+            time_ms=time_ms,
+        )
+
+        success = await upsert_member_row_by_qq_with_retry(
+            fields=fields,
+            qq_num=qq_key,
+            config=self.config,
+            qq_field_name="QQ号",
+        )
+
+        if success:
+            logger.info(f"[BiliVerifyFeishu][qq_official] 飞书写入成功: UID={uid}, QQ={user_id}")
+        else:
+            logger.error(
+                f"[BiliVerifyFeishu][qq_official] 飞书写入失败，已加入待处理队列: UID={uid}, QQ={user_id}"
+            )
             add_to_pending(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -739,41 +924,67 @@ class BiliVerifyFeishuPlugin(Star):
     # ---- QQ 掉线检测（OneBot get_status + 飞书通知） ----
 
     async def _is_qq_online(self) -> bool:
-        """通过 OneBot API 探测 QQ 是否在线。返回 True 表示在线。
+        """探测 QQ 是否在线。兼容 aiocqhttp (OneBot) 与 qq_official。
 
-        依据 OneBot 11 协议文档:
-        - get_status 返回 {online: bool, good: bool}
-        - get_login_info 在离线时通常抛异常或返回空
-        同时兼容通过 aiocqhttp 底层 ws 客户端是否为空的前置判断。
+        - aiocqhttp: 通过 get_status / ws 客户端存在性判断
+        - qq_official: 通过 get_platform 存活性 + botpy 客户端是否关闭判断（官方 WS 掉线时平台仍在但 client.is_closed）
         """
-        client = self._get_aiocqhttp_client()
-        if client is None or not hasattr(client, "api"):
-            return False
-
-        try:
-            api_clients = getattr(client, "_wsr_api_clients", None)
-            event_clients = getattr(client, "_wsr_event_clients", None)
-            if isinstance(api_clients, dict) and isinstance(event_clients, set):
-                if not api_clients and not event_clients:
-                    return False
-        except Exception:
-            pass
-
-        try:
-            ret = await client.api.call_action("get_status")
-            payload = ret.get("data", ret) if isinstance(ret, dict) else ret
-            if isinstance(payload, dict):
-                if "online" in payload:
-                    return bool(payload.get("online")) and bool(payload.get("good", True))
-                if "good" in payload:
-                    return bool(payload.get("good"))
-                if "stat" in payload:
+        # 优先尝试 aiocqhttp 路径
+        if self._has_aiocqhttp():
+            client = self._get_aiocqhttp_client()
+            if client is None or not hasattr(client, "api"):
+                # aiocqhttp 平台存在但客户端未就绪，视为离线
+                return False
+            try:
+                api_clients = getattr(client, "_wsr_api_clients", None)
+                event_clients = getattr(client, "_wsr_event_clients", None)
+                if isinstance(api_clients, dict) and isinstance(event_clients, set):
+                    if not api_clients and not event_clients:
+                        return False
+            except Exception:
+                pass
+            try:
+                ret = await client.api.call_action("get_status")
+                payload = ret.get("data", ret) if isinstance(ret, dict) else ret
+                if isinstance(payload, dict):
+                    if "online" in payload:
+                        return bool(payload.get("online")) and bool(payload.get("good", True))
+                    if "good" in payload:
+                        return bool(payload.get("good"))
+                    if "stat" in payload:
+                        return True
                     return True
                 return True
-            return True
-        except Exception as e:
-            logger.debug(f"[BiliVerifyFeishu] get_status 探测失败: {e}")
-            return False
+            except Exception as e:
+                logger.debug(f"[BiliVerifyFeishu] get_status 探测失败: {e}")
+                return False
+
+        # qq_official 路径
+        if self._has_qqofficial():
+            client = self._get_qqofficial_client()
+            if client is None:
+                return False
+            # botpy Client 有 is_closed / _closed 等状态
+            try:
+                if hasattr(client, "is_closed"):
+                    # is_closed 可能是方法或属性
+                    is_closed = client.is_closed
+                    if callable(is_closed):
+                        is_closed = is_closed()
+                    if is_closed:
+                        return False
+                # 额外检查平台底层心跳：尝试获取平台实例
+                platform = self.context.get_platform(filter.PlatformAdapterType.QQOFFICIAL)
+                if platform is not None:
+                    # 若近期有事件，session 缓存非空也算在线依据（弱判断）
+                    return True
+                return True
+            except Exception as e:
+                logger.debug(f"[BiliVerifyFeishu] qq_official 在线探测失败: {e}")
+                return False
+
+        # 无可用平台则视为离线
+        return False
 
     async def _offline_monitor_loop(self, interval_seconds: int):
         """定时探测 QQ 在线状态，阈值触发后通过飞书通知，恢复后补偿扫描。"""
