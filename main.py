@@ -69,6 +69,8 @@ class BiliVerifyFeishuPlugin(Star):
         self._member_registry: Any | None = None
         self._admission_service: Any | None = None
         self._platform_port: Any | None = None  # PlatformPort interface，两个 adapter 复用同一 seam
+        # qq_official 轮询：无效/不可拉取群缓存（数字群号、UMO 全串、已注销群），避免每轮重复报错
+        self._qqofficial_invalid_groups: set[str] = set()
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         """读取 AstrBot 注入的插件配置。"""
@@ -1152,8 +1154,27 @@ class BiliVerifyFeishuPlugin(Star):
         except Exception as e:
             logger.error(f"[BiliVerifyFeishu] QQ官方入群轮询异常退出: {e}")
 
+    @staticmethod
+    def _is_valid_group_openid(g: str) -> bool:
+        """判断是否为合法的 qq_official group_openid。
+
+        官方 group_openid 为大写十六进制风格字符串（如 6CCC18AB28098F241B44FF1A41F6668F）。
+        - 纯数字（aiocqhttp 群号）→ 不适用于官方接口
+        - 含 ':' 或为 UMO 全串（default_xxx:GroupMessage:xxx）→ 不适用
+        - 过短/含非法字符 → 视为无效
+        """
+        s = str(g or "").strip()
+        if not s or ":" in s:
+            return False
+        if s.isdigit():
+            return False
+        # 官方 openid 常见长度 32；放宽为 16-64 的大写十六进制
+        if not (8 <= len(s) <= 128):
+            return False
+        return True
+
     async def _poll_qqofficial_join_requests_once(self):
-        """单次轮询所有白名单群的入群申请。"""
+        """单次轮询所有白名单群的入群申请。自动过滤非 qq_official 的白名单项与已知无效群。"""
         whitelist = load_whitelist()
         if not whitelist:
             return
@@ -1161,6 +1182,13 @@ class BiliVerifyFeishuPlugin(Star):
         for group_openid in whitelist:
             g = str(group_openid).strip()
             if not g:
+                continue
+            # 过滤：非官方 openid 格式 或 已知无效/不可达
+            if g in self._qqofficial_invalid_groups:
+                continue
+            if not self._is_valid_group_openid(g):
+                logger.debug(f"[BiliVerifyFeishu] 跳过非 qq_official 白名单项: {g}")
+                self._qqofficial_invalid_groups.add(g)
                 continue
             try:
                 await self._poll_single_group_join_requests(g)
@@ -1218,10 +1246,18 @@ class BiliVerifyFeishuPlugin(Star):
                 try:
                     ret = await http.request(route, json=params if params else None)
                 except Exception as e:
-                    logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {e}")
+                    msg = str(e)
+                    logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
+                    if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
+                        self._qqofficial_invalid_groups.add(group_openid)
+                        logger.info(f"[BiliVerifyFeishu] 群不可达，本轮起跳过轮询: {group_openid}")
                     return
             except Exception as e:
-                logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {e}")
+                msg = str(e)
+                logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
+                if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
+                    self._qqofficial_invalid_groups.add(group_openid)
+                    logger.info(f"[BiliVerifyFeishu] 群不可达，本轮起跳过轮询: {group_openid}")
                 return
 
             if ret is None:
