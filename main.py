@@ -1,6 +1,7 @@
 import asyncio
 import random
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,10 +42,13 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.0.4",
+    "0.0.5",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
+    # 群被标记"无 bot 关联"后的重探间隔（秒）：到期自动重试，兼容后续才进群/给管理员的场景
+    _QQOFFICIAL_INVALID_RETRY_SECONDS = 1800.0
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
@@ -69,8 +73,12 @@ class BiliVerifyFeishuPlugin(Star):
         self._member_registry: Any | None = None
         self._admission_service: Any | None = None
         self._platform_port: Any | None = None  # PlatformPort interface，两个 adapter 复用同一 seam
-        # qq_official 轮询：无效/不可拉取群缓存（数字群号、UMO 全串、已注销群），避免每轮重复报错
-        self._qqofficial_invalid_groups: set[str] = set()
+        # qq_official 轮询：不可拉取群缓存（数字群号、UMO 全串、确认无 bot 关联的群）
+        # 值为标记时间戳，超过 _QQOFFICIAL_INVALID_RETRY_SECONDS 自动过期重探，
+        # 避免"当时无权限/未进群，之后才拉进群"被永久误判
+        self._qqofficial_invalid_groups: dict[str, float] = {}
+        # 群 openid -> 平台实例ID（UMO 首段）：轮询时由白名单条目解析得出，审批路径复用
+        self._group_openid_pid: dict[str, str] = {}
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         """读取 AstrBot 注入的插件配置。"""
@@ -332,6 +340,49 @@ class BiliVerifyFeishuPlugin(Star):
     def _get_qqofficial_client(self, event: AstrMessageEvent | None = None):
         """获取 qq_official 客户端（botpy.Client）。"""
         return self._get_platform_client(filter.PlatformAdapterType.QQOFFICIAL, event)
+
+    def _qqofficial_adapters(self) -> list[Any]:
+        """枚举所有 qq_official 平台适配器实例（实例可同时配置多个 bot）。
+
+        context.get_platform 只返回第一个同名平台，多 bot 场景下会拿错凭据
+        （官方网关对"与本 bot 无关的群"返回 11255 资源不存在），
+        因此归属必须由白名单 UMO 首段 / event.get_platform_id() 显式给出。
+        """
+        try:
+            insts = list(self.context.platform_manager.platform_insts)
+        except Exception:
+            return []
+        out: list[Any] = []
+        for p in insts:
+            try:
+                if getattr(p.meta(), "name", "") == "qq_official":
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def _qqofficial_adapter_by_id(self, platform_id: str) -> Any | None:
+        """按平台实例 ID（UMO 首段 / meta().id）精确定位 qq_official 适配器。"""
+        if not platform_id:
+            return None
+        for p in self._qqofficial_adapters():
+            try:
+                if str(p.meta().id or "") == platform_id:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _client_to_http(client: Any) -> Any:
+        """从 botpy Client 提取底层 http 客户端；兼容 client 本身即 http 的场景。"""
+        if client is None:
+            return None
+        http = getattr(getattr(client, "api", None), "_http", None)
+        if http is None:
+            # 兜底：client 本身可能就是 http
+            http = getattr(client, "_http", None)
+        return http
 
     def _has_platform(self, platform_type) -> bool:
         """检查指定平台是否已在 AstrBot 中注册。"""
@@ -1155,40 +1206,37 @@ class BiliVerifyFeishuPlugin(Star):
             logger.error(f"[BiliVerifyFeishu] QQ官方入群轮询异常退出: {e}")
 
     @staticmethod
-    def _normalize_group_openid(g: str) -> str:
-        """归一化白名单项为可请求的 qq_official group_openid。
+    def _split_umo_entry(entry: str) -> tuple[str, str]:
+        """解析白名单条目，返回 (group_openid, 平台实例ID提示)。
 
         兼容三种写法：
-        - 纯 group_openid：6CCC18AB28098F241B44FF1A41F6668F
+        - 纯 group_openid：6CCC18AB28098F241B44FF1A41F6668F → (openid, "")
         - UMO 全串：default_1905473952:GroupMessage:6CCC18AB28098F241B44FF1A41F6668F
-          （取最后一段 Session ID）
-        - aiocqhttp 数字群号：1048195177 → 返回空串，由调用方跳过
-
-        官方接口只认 group_openid；数字群号属 OneBot 语义，无法转官方 openid。
+          → (openid, "default_1905473952")
+          首段即 bot 的平台实例 ID（与 event.get_platform_id() 同源），
+          多 bot 场景下可据此直接定位归属客户端，无需逐个探测。
+          之前只取最后一段 Session ID、丢弃首段，正是多 bot 时拿错凭据的根源。
+        - aiocqhttp 数字群号：1048195177 → ("", "")（OneBot 语义，官方接口不可用）
         """
-        s = str(g or "").strip()
+        s = str(entry or "").strip()
         if not s:
-            return ""
-        # UMO 全串：取 ':' 分隔的最后一段作为 Session ID
+            return "", ""
+        platform_id = ""
         if ":" in s:
-            s = s.rsplit(":", 1)[-1].strip()
-        if not s:
-            return ""
-        # 数字群号是 OneBot 语义，官方接口不可用
-        if s.isdigit():
-            return ""
-        # 长度/字符宽松校验（官方 openid 为大写十六进制风格，长度常见 32）
-        if not (8 <= len(s) <= 128):
-            return ""
-        return s
+            parts = s.split(":")
+            platform_id = parts[0].strip()
+            s = parts[-1].strip()
+        if not s or s.isdigit() or not (8 <= len(s) <= 128):
+            return "", ""
+        return s, platform_id
 
     async def _poll_qqofficial_join_requests_once(self):
         """单次轮询所有白名单群的入群申请。
 
-        白名单项自动归一化：支持纯 group_openid、UMO 全串、数字群号混写。
-        - UMO 全串 → 取 Session ID 段请求官方接口
-        - 数字群号 → 跳过（OneBot 语义）
-        - 已知无效/不可达群 → 缓存跳过
+        白名单项须为完整 UMO（平台实例ID:消息类型:群openid）：
+        - 首段精确定位 bot 实例，多 bot 场景不会拿错凭据
+        - 数字群号/纯 openid 等无法定位实例的条目 → 跳过
+        - 已知无关联群 → 带时间戳标记，超期自动重探
         """
         whitelist = load_whitelist()
         if not whitelist:
@@ -1197,39 +1245,64 @@ class BiliVerifyFeishuPlugin(Star):
         # 频率控制：每个群间隔约 0.5s，避免触发 30QPM 限制
         for group_openid in whitelist:
             raw_entry = str(group_openid).strip()
-            g = self._normalize_group_openid(raw_entry)
-            if not g:
-                if raw_entry and raw_entry not in self._qqofficial_invalid_groups:
-                    logger.debug(f"[BiliVerifyFeishu] 跳过非 qq_official 白名单项: {raw_entry}")
+            g, pid = self._split_umo_entry(raw_entry)
+            if not g or not pid:
+                if raw_entry:
+                    logger.debug(f"[BiliVerifyFeishu] 跳过无法解析平台实例的白名单项: {raw_entry}")
                 continue
-            if g in self._qqofficial_invalid_groups:
-                continue
+            marked_at = self._qqofficial_invalid_groups.get(g)
+            if marked_at is not None:
+                if time.time() - marked_at < self._QQOFFICIAL_INVALID_RETRY_SECONDS:
+                    continue
+                del self._qqofficial_invalid_groups[g]  # 标记过期，本轮重探
             if g in seen:
                 continue  # 同一 openid 多条白名单项只拉一次
             seen.add(g)
+            self._group_openid_pid[g] = pid  # 审批路径据此复用同一 bot
             try:
-                await self._poll_single_group_join_requests(g)
+                await self._poll_single_group_join_requests(g, pid)
             except Exception as e:
                 logger.debug(f"[BiliVerifyFeishu] 拉取群 {g} 入群申请失败: {e}")
             await asyncio.sleep(0.5)
 
-    async def _poll_single_group_join_requests(self, group_openid: str):
-        """拉取单个群的入群申请并处理。"""
-        client = self._get_qqofficial_client()
-        if client is None:
-            logger.debug("[BiliVerifyFeishu] 无法获取 qq_official 客户端，跳过轮询")
+    async def _poll_single_group_join_requests(self, group_openid: str, platform_id: str):
+        """用 UMO 首段指定的 bot 实例拉取单个群的入群申请。
+
+        归属由白名单条目显式给出（AstrBot 的 UMO 首段即 event.get_platform_id()），
+        不做客户端探测；「与群无关」（11255，bot 已被移出/未授权）打时间戳标记，
+        超期自动重探以兼容后续重新进群的场景。
+        """
+        adapter = self._qqofficial_adapter_by_id(platform_id)
+        if adapter is None:
+            logger.warning(f"[BiliVerifyFeishu] 未找到平台实例 {platform_id}，跳过: {group_openid}")
             return
-        # 兼容 botpy 版本差异：优先使用 BotAPI._http.request + Route
+        http = self._client_to_http(adapter.get_client())
+        if http is None:
+            logger.warning(f"[BiliVerifyFeishu] 平台实例 {platform_id} 无可用 http 客户端")
+            return
+        try:
+            outcome = await self._poll_group_join_requests_via(group_openid, http)
+        except Exception as e:
+            logger.debug(f"[BiliVerifyFeishu] 拉取群 {group_openid} 失败({platform_id}): {e}")
+            return
+        if outcome == "not_related":
+            self._qqofficial_invalid_groups[group_openid] = time.time()
+            logger.info(
+                f"[BiliVerifyFeishu] bot({platform_id}) 与该群无关联（可能已被移出），"
+                f"{self._QQOFFICIAL_INVALID_RETRY_SECONDS:.0f}s 后自动重探: {group_openid}"
+            )
+
+    async def _poll_group_join_requests_via(self, group_openid: str, http: Any) -> str:
+        """用指定 bot 的 http 客户端拉取单个群的入群申请。
+
+        返回 "not_related" 表示该 bot 与此群无关联（11255），由调用方打超期重探标记；
+        其余返回值（含 None）均视为本次调用有效。
+        """
         try:
             from botpy.http import Route
         except Exception:
             logger.warning("[BiliVerifyFeishu] 未找到 botpy.http.Route，跳过QQ官方拉取")
-            return
-
-        http = getattr(getattr(client, "api", None), "_http", None)
-        if http is None:
-            # 兜底：client 本身可能就是 http
-            http = getattr(client, "_http", None)
+            return "no_route"
         if http is None:
             logger.warning("[BiliVerifyFeishu] 无法获取 qq_official http 客户端")
             return
@@ -1266,15 +1339,13 @@ class BiliVerifyFeishuPlugin(Star):
                     msg = str(e)
                     logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
                     if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
-                        self._qqofficial_invalid_groups.add(group_openid)
-                        logger.info(f"[BiliVerifyFeishu] 群不可达，本轮起跳过轮询: {group_openid}")
+                        return "not_related"
                     return
             except Exception as e:
                 msg = str(e)
                 logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
                 if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
-                    self._qqofficial_invalid_groups.add(group_openid)
-                    logger.info(f"[BiliVerifyFeishu] 群不可达，本轮起跳过轮询: {group_openid}")
+                    return "not_related"
                 return
 
             if ret is None:
@@ -1466,21 +1537,18 @@ class BiliVerifyFeishuPlugin(Star):
         approve: bool,
         reject_reason: str = "",
     ) -> bool:
-        """调用官方审批接口。"""
-        client = self._get_qqofficial_client()
-        if client is None:
-            logger.error("[BiliVerifyFeishu] 审批失败: 无法获取 qq_official 客户端")
+        """调用官方审批接口：使用轮询时记录的群归属平台实例（UMO 首段）。"""
+        pid = self._group_openid_pid.get(group_openid, "")
+        adapter = self._qqofficial_adapter_by_id(pid)
+        if adapter is None:
+            logger.error(
+                f"[BiliVerifyFeishu] 审批失败: 群 {group_openid} 归属实例不存在: {pid or '(未记录)'}"
+            )
             return False
         try:
             from botpy.http import Route
         except Exception:
             logger.error("[BiliVerifyFeishu] 审批失败: 未找到 botpy.http.Route")
-            return False
-        http = getattr(getattr(client, "api", None), "_http", None)
-        if http is None:
-            http = getattr(client, "_http", None)
-        if http is None:
-            logger.error("[BiliVerifyFeishu] 审批失败: 无法获取 http 客户端")
             return False
 
         route = Route(
@@ -1496,15 +1564,20 @@ class BiliVerifyFeishuPlugin(Star):
         if not approve and reject_reason:
             payload["reject_reason"] = reject_reason
 
+        http = self._client_to_http(adapter.get_client())
+        if http is None:
+            logger.error(f"[BiliVerifyFeishu] 审批失败: 平台实例 {pid} 无可用 http 客户端")
+            return False
         try:
             ret = await http.request(route, json=payload)
-            logger.info(
-                f"[BiliVerifyFeishu] 已处理QQ官方入群申请: approve={approve}, group={group_openid}, member={member_openid}, ret={ret}"
-            )
-            return True
         except Exception as e:
-            logger.error(f"[BiliVerifyFeishu] 处理QQ官方入群申请失败: {e}")
+            logger.error(f"[BiliVerifyFeishu] 处理QQ官方入群申请失败({pid}): {e}")
             return False
+        logger.info(
+            f"[BiliVerifyFeishu] 已处理QQ官方入群申请({pid}): approve={approve}, "
+            f"group={group_openid}, member={member_openid}, ret={ret}"
+        )
+        return True
 
     async def terminate(self):
         """插件销毁。"""
