@@ -44,7 +44,7 @@ from .member_registry import MemberRegistry
 from .platform_port import JoinRequest
 from .plugin_config import PluginConfig
 
-Decision = Literal["approve", "decline"]
+Decision = Literal["approve", "decline", "skip"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,10 +107,11 @@ class AdmissionService:
         comment = req.comment or ""
         key = f"{group}:{user}:{req.join_request_id}"
 
-        # 去重：join_request_id 维度
-        if self._store.dedup(key):
-            logger.debug(f"[Admission] dedup hit {key}")
-            return AdmissionResult(decision="approve", uid=None, reason="dedup")
+        # 去重:join_request_id 维度。
+        # dedup() 语义:True=首次出现(继续处理),False=重复(跳过)。
+        if not self._store.dedup(key):
+            logger.debug(f"[Admission] 重复申请跳过 {key}")
+            return AdmissionResult(decision="skip", uid=None, reason="duplicate")
 
         # 白名单由 store 判断（保持 locality）
         if not self._store.is_whitelisted(group):
@@ -127,8 +128,9 @@ class AdmissionService:
         # 飞书落库（经 MemberRegistry 深 module）
         ok = await self._registry.register(int(uid), user, req.username)
         if ok:
+            # mark_verified 已同时移除 pending;不得再调 discard_pending,
+            # 否则会把 _verified_before_join 一并清掉,group_increase 无法跳过二次待补
             self._store.mark_verified(group, user)
-            self._store.discard_pending(group, user)
             logger.info(f"[Admission] 入群 UID 写入成功 group={group} user={user} uid={uid}")
             return AdmissionResult(decision="approve", uid=uid)
         else:

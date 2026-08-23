@@ -3,24 +3,16 @@
 覆盖 admit_request / admit_message 的每个 Decision 分支与 _extract_uid 纯函数。
 飞书经 FakeRegistry 替身注入，全程零网络。
 
-⚠️ 已知疑似 bug（不在本任务修复，仅钉住现状）：
-    admission.admit_request 中 ``if self._store.dedup(key):`` 的语义与
-    AdmissionsStore.dedup 的 docstring 相反——dedup 首次见到某 key 返回 True
-    （意为"新请求，可继续处理"），而 admit_request 把 True 当"重复命中"
-    直接短路 approve(reason="dedup")。实际效果是：同一 join_request_id 的
-    第一次申请不经过 UID 校验/白名单/飞书即被放行，重复的第二次申请反而
-    走完整流程。相关测试以"先手动烧掉 dedup 首见"的方式绕过该短路来测
-    后续分支，并在 duplicate 用例中断言现状。
-
-    #2 admit_request 成功路径先 mark_verified 再 discard_pending，而
-    AdmissionsStore.discard_pending 会同时清除 _verified_before_join——
-    mark_verified "供 group_increase 跳过二次待补"的效果被立即抹掉。
-    test_approve_合法UID放行并写飞书 已钉住该现状。
+历史备注（两个疑似 bug 已于 v0.0.6 修复，用例改为断言正确语义）：
+    #1 dedup 语义反转——admit_request 曾把 dedup() 首见 True 当"重复命中"
+    短路放行，导致首次申请绕过 UID 校验/白名单/飞书；现首次走完整流程、
+    重复返回 decision="skip"。
+    #2 成功路径 mark_verified 后又调 discard_pending 清掉 verified 标记；
+    现只调 mark_verified（其本身已移除 pending），group_increase 可跳过二次待补。
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 import pytest
@@ -34,9 +26,6 @@ from astrbot_plugin_bili_verify_feishu.admissions_store import AdmissionsStore
 from astrbot_plugin_bili_verify_feishu.platform_port import JoinRequest
 from astrbot_plugin_bili_verify_feishu.plugin_config import PluginConfig
 
-GROUP = "6CCC18AB28098F241B44FF1A41F6668F"
-
-
 # --------------------------------------------------------------------------- #
 # 测试替身
 # --------------------------------------------------------------------------- #
@@ -49,8 +38,8 @@ class FakeRegistry:
         self.ok = ok
         self.calls: list[tuple[int, str, str]] = []
 
-    async def register(self, uid: int, openid: str, nickname: str = "") -> bool:
-        self.calls.append((uid, openid, nickname))
+    async def register(self, uid: int, user: str, nickname: str) -> bool:
+        self.calls.append((uid, user, nickname))
         return self.ok
 
 
@@ -66,11 +55,8 @@ _ZERO_DELAY = {"REQUEST_DELAY_MIN_SECONDS": 0, "REQUEST_DELAY_MAX_SECONDS": 0}
 
 def make_harness(tmp_path, registry: FakeRegistry | None = None, groups=("g1",)) -> Harness:
     store = AdmissionsStore(data_dir=tmp_path)
-    # 白名单文件由测试直接写入（store 只负责读）
-    (tmp_path / "whitelist.json").write_text(
-        json.dumps({"groups": list(groups)}, ensure_ascii=False), encoding="utf-8"
-    )
-    reg = registry or FakeRegistry()
+    store._save_whitelist_to_file(list(groups))
+    reg = registry if registry is not None else FakeRegistry()
     # 延迟钳为 0：决策域测试不测随机 sleep（_delay_if_needed 另有专项用例）
     config = PluginConfig.from_dict(_ZERO_DELAY)
     return Harness(AdmissionService(reg, store, config), store, reg)
@@ -82,11 +68,6 @@ def make_req(**kw) -> JoinRequest:
     return JoinRequest(**base)
 
 
-def burn_dedup(h: Harness, req: JoinRequest) -> None:
-    """绕过 dedup 反转短路（见模块 docstring 疑似 bug）：公开 API 手动消耗首见。"""
-    h.store.dedup(f"{req.group_openid.strip()}:{req.member_openid.strip()}:{req.join_request_id}")
-
-
 # --------------------------------------------------------------------------- #
 # Decision 分支
 # --------------------------------------------------------------------------- #
@@ -96,7 +77,6 @@ def burn_dedup(h: Harness, req: JoinRequest) -> None:
 async def test_approve_合法UID放行并写飞书(tmp_path):
     h = make_harness(tmp_path)
     req = make_req(comment="我的B站UID是 123456789")
-    burn_dedup(h, req)
 
     result = await h.service.admit_request(req)
 
@@ -105,11 +85,9 @@ async def test_approve_合法UID放行并写飞书(tmp_path):
     assert result.uid == "123456789"
     assert result.reason == ""
     assert h.registry.calls == [(123456789, "u1", "")]
-    # ⚠️ 现状（疑似 bug #2）：admit_request 成功后先 mark_verified 再 discard_pending，
-    # 而 discard_pending 会同时清除 verified 集合——mark_verified 的
-    # "供 group_increase 跳过二次待补"效果被立即抹掉。此处钉住现状。
+    # 修复 #2 后：verified 标记保留（供 group_increase 跳过二次待补），pending 清空
     snap = h.store._snapshot_memory()
-    assert "g1:u1" not in snap["verified_before_join"]
+    assert "g1:u1" in snap["verified_before_join"]
     assert "g1:u1" not in snap["pending_uid"]
 
 
@@ -117,7 +95,6 @@ async def test_approve_合法UID放行并写飞书(tmp_path):
 async def test_decline_无UID拒绝且不写飞书(tmp_path):
     h = make_harness(tmp_path)
     req = make_req(comment="   ")
-    burn_dedup(h, req)
 
     result = await h.service.admit_request(req)
 
@@ -133,7 +110,6 @@ async def test_decline_UID提取失败_格式不符(tmp_path):
     h = make_harness(tmp_path)
     for comment in ("我爱这个群", "群号 123"):
         req = make_req(join_request_id=f"req-{comment}", comment=comment)
-        burn_dedup(h, req)
         result = await h.service.admit_request(req)
         assert result.decision == "decline", comment
     assert h.registry.calls == []
@@ -141,10 +117,9 @@ async def test_decline_UID提取失败_格式不符(tmp_path):
 
 @pytest.mark.asyncio
 async def test_whitelist_rejected_白名单外零动作(tmp_path):
-    """非白名单群：不写飞书、不放行。注意 dedup 消耗在白名单判断之前（现状）。"""
+    """非白名单群：不写飞书、不放行。dedup 消耗在白名单判断之前（顺序保持现状）。"""
     h = make_harness(tmp_path, groups=("g1",))
     req = make_req(group_openid="g-other", comment="123456789")
-    burn_dedup(h, req)
 
     result = await h.service.admit_request(req)
 
@@ -157,13 +132,11 @@ async def test_whitelist_rejected_白名单外零动作(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_同join_request_id去重_现状断言(tmp_path):
-    """⚠️ 断言的是疑似反转后的现状（见模块 docstring）：
+async def test_duplicate_同join_request_id_首次完整流程_重复跳过(tmp_path):
+    """修复 #1 后的正确语义：
 
-    - 第 1 次：dedup 首见 True → 被当"重复"短路 approve(uid=None, reason="dedup")，
-      未做任何 UID 校验、未写飞书；
-    - 第 2 次（同 join_request_id 重复申请）：dedup False → 反而走完整审批流程。
-      若上游修复反转语义，本用例应同步改写。
+    - 第 1 次：走完整审批流程（UID 校验 → 飞书 → approve）；
+    - 第 2 次（同 join_request_id 重复申请）：decision="skip"，不再写飞书。
     """
     h = make_harness(tmp_path)
     first = make_req(comment="123456789")
@@ -172,9 +145,9 @@ async def test_duplicate_同join_request_id去重_现状断言(tmp_path):
     r1 = await h.service.admit_request(first)
     r2 = await h.service.admit_request(second)
 
-    assert r1.decision == "approve" and r1.reason == "dedup" and r1.uid is None
-    assert r2.decision == "approve" and r2.uid == "123456789" and r2.reason == ""
-    # 第一次短路未写飞书；第二次才走完整流程写了一次
+    assert r1.decision == "approve" and r1.uid == "123456789"
+    assert r2.decision == "skip" and r2.reason == "duplicate"
+    # 只有第一次写了飞书
     assert len(h.registry.calls) == 1
 
 
@@ -183,7 +156,6 @@ async def test_feishu失败仍放行并入补偿队列(tmp_path):
     """飞书写入失败的原策略：仍放行用户，记录入 pending 由补偿任务重试。"""
     h = make_harness(tmp_path, registry=FakeRegistry(ok=False))
     req = make_req(comment="100200300")
-    burn_dedup(h, req)
 
     result = await h.service.admit_request(req)
 

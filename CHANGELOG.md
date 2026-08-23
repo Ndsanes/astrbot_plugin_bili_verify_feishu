@@ -2,6 +2,17 @@
 
 本文件供 AstrBot 面板「插件更新日志」读取（`CHANGELOG.md`）。每次发版前更新对应条目。
 
+## v0.0.6 (2026-08-24)
+
+### 修复
+
+- **【严重】入群申请去重语义反转**：`admit_request` 把 `AdmissionsStore.dedup` 的"首次出现"返回值误当"重复命中"，导致每个新 `join_request_id` 的第一次申请**不经过 UID 校验/白名单判断即被放行**，重复的第二次申请反而走完整流程。现已按 store 语义反转分支：首次走完整审批（UID 校验 → 飞书登记），重复申请返回 `skip` 不做任何平台动作。
+- **成功路径 verified 标记被误清**：UID 登记成功后先 `mark_verified` 又调 `discard_pending`，后者会把 `_verified_before_join` 一并清除，使进群事件（group_increase）无法跳过二次待补。现只调 `mark_verified`（其本身已移除 pending）。
+
+### 测试
+
+- 新增领域测试 42 项：Decision 分支（approve/decline/skip）、AdmissionsStore 状态机与去重、白名单 UMO 归一化、11255 重探计时。
+
 ## v0.0.5 (2026-08-23)
 
 ### 修复
