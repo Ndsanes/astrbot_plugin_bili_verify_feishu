@@ -307,11 +307,24 @@ class AdmissionsStore:
         return list(self._whitelist_cache)
 
     def is_whitelisted(self, group: str | int) -> bool:
-        """快捷判断：群是否在白名单。"""
+        """快捷判断：群是否在白名单。
+
+        白名单条目有两种合法形态（多 bot 场景下 qq_official 须为完整 UMO）：
+          - 裸群号 / 群 openid：``1048195177``、``6CCC18AB...``
+          - 完整 UMO：``default_1905473952:GroupMessage:6CCC18AB...``
+        运行时事件/轮询传入的通常是裸 openid，因此除精确匹配外，
+        还按条目末段（冒号最后一段）匹配，避免形态不一致导致永远判否。
+        """
         gid = str(group).strip()
         if not gid:
             return False
-        return gid in self.load_whitelist_cached()
+        for entry in self.load_whitelist_cached():
+            e = str(entry).strip()
+            if gid == e:
+                return True
+            if ":" in e and e.rsplit(":", 1)[-1].strip() == gid:
+                return True
+        return False
 
     # ------------------------------------------------------------------ #
     # 额外 seam：供整合任务或测试使用的状态探针（不扩大 interface）

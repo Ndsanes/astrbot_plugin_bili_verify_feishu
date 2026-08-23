@@ -152,6 +152,17 @@ def test_whitelist_persistence_roundtrip(tmp_path: Path):
     assert store.is_whitelisted("  g2 ") is True  # 归一化后命中
 
 
+def test_whitelist_UMO条目按裸openid末段命中(tmp_path: Path):
+    """多 bot 轮询改造后白名单为完整 UMO；运行时传入裸 openid 也必须命中。"""
+    _write_whitelist(tmp_path, [_UMO])
+    store = AdmissionsStore(data_dir=tmp_path)
+    bare = "6CCC18AB28098F241B44FF1A41F6668F"
+    assert store.is_whitelisted(bare) is True
+    assert store.is_whitelisted(_UMO) is True  # 全串精确匹配保持
+    assert store.is_whitelisted("GroupMessage") is False  # 非末段不误伤
+    assert store.is_whitelisted("default_appid") is False
+
+
 def test_whitelist_cache_外部改文件需force_reload(tmp_path: Path):
     _write_whitelist(tmp_path, ["g1"])
     store = AdmissionsStore(data_dir=tmp_path)
