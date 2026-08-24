@@ -81,10 +81,7 @@ PENDING_CHECK_INTERVAL_DEFAULT = 3800
 
 @dataclass(frozen=True, slots=True)
 class FeishuCfg:
-    # app_id/app_secret 已弃用：认证由 lark_cli 平台网关统一负责，键保留仅为兼容旧配置
-    app_id: str = ""
-    app_secret: str = ""
-    # 业务数据归属配置：多维表格坐标仍由本插件自持
+    # 认证由 lark_cli 平台网关统一负责；业务数据归属（多维表格坐标）仍由本插件自持
     app_token: str = ""
     table_id: str = ""
     status_field: str = "状态"
@@ -157,8 +154,6 @@ class PluginConfig:
     def from_dict(cls, raw: Mapping[str, Any] | None) -> PluginConfig:
         raw = dict(raw or {})
         feishu = FeishuCfg(
-            app_id=str(raw.get("FEISHU_APP_ID", "") or "").strip(),
-            app_secret=str(raw.get("FEISHU_APP_SECRET", "") or "").strip(),
             app_token=str(raw.get("FEISHU_APP_TOKEN", "") or "").strip(),
             table_id=str(raw.get("FEISHU_TABLE_ID", "") or "").strip(),
             status_field=str(raw.get("FEISHU_STATUS_FIELD", "状态") or "状态").strip(),
@@ -240,7 +235,7 @@ class PluginConfig:
         )
 
     def validate(self) -> list[str]:
-        # 认证（FEISHU_APP_ID/SECRET）已由 lark_cli 平台网关统一负责，不再必填
+        # 认证已由 lark_cli 平台网关统一负责，本插件只校验业务数据归属配置
         errs: list[str] = []
         for k in ("app_token", "table_id"):
             if not getattr(self.feishu, k):
@@ -250,8 +245,6 @@ class PluginConfig:
     # 兼容 Mapping.get 语义，窄 interface 外的过渡 seam
     def get(self, key: str, default: Any = None) -> Any:
         mapping: dict[str, Any] = {
-            "FEISHU_APP_ID": self.feishu.app_id,
-            "FEISHU_APP_SECRET": self.feishu.app_secret,
             "FEISHU_APP_TOKEN": self.feishu.app_token,
             "FEISHU_TABLE_ID": self.feishu.table_id,
             "FEISHU_STATUS_FIELD": self.feishu.status_field,
@@ -280,8 +273,6 @@ class PluginConfig:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "FEISHU_APP_ID": self.feishu.app_id,
-            "FEISHU_APP_SECRET": self.feishu.app_secret,
             "FEISHU_APP_TOKEN": self.feishu.app_token,
             "FEISHU_TABLE_ID": self.feishu.table_id,
             "FEISHU_STATUS_FIELD": self.feishu.status_field,

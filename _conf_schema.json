@@ -1,18 +1,4 @@
 {
-  "FEISHU_APP_ID": {
-    "description": "飞书应用 App ID（已弃用，认证由 lark_cli 平台网关负责，无需填写）",
-    "type": "string",
-    "hint": "已弃用：保留仅为兼容旧配置，填写也不会被使用",
-    "default": "",
-    "obvious_hint": true
-  },
-  "FEISHU_APP_SECRET": {
-    "description": "飞书应用 App Secret（已弃用，认证由 lark_cli 平台网关负责，无需填写）",
-    "type": "string",
-    "hint": "已弃用：保留仅为兼容旧配置，填写也不会被使用",
-    "default": "",
-    "obvious_hint": true
-  },
   "FEISHU_APP_TOKEN": {
     "description": "飞书多维表格 App Token",
     "type": "string",

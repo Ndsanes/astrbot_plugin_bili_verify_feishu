@@ -53,7 +53,7 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 ## 真实环境验证（.env）
 
 网关化改造后，认证、登录态、TAT 刷新与限速全部由 lark_cli 平台适配器（网关）统一负责，
-本插件不再自持 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（旧配置键保留但已弃用，填写也不会被使用）。
+本插件不再自持 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（v0.1.2 起配置键已移除）。
 
 1. 在项目根目录创建 `.env`，至少包含：
 	- `FEISHU_APP_TOKEN`

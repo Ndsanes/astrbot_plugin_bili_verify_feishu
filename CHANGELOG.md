@@ -2,6 +2,13 @@
 
 本文件供 AstrBot 面板「插件更新日志」读取（`CHANGELOG.md`）。每次发版前更新对应条目。
 
+## v0.1.2 (2026-08-24)
+
+### 清理
+
+- 移除已弃用的配置键 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（v0.1.0 网关化改造后认证全部由 lark_cli 平台网关负责，键保留仅为兼容旧配置）：`_conf_schema.json` 不再展示、`FeishuCfg.app_id/app_secret` 字段与 `from_dict`/`get`/`as_dict` 中的对应条目一并删除。已填写的旧值会被忽略，无需处理。
+- `FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID`（业务数据归属）不变；bot 身份经 gateway.api() 的多维表格读写链路未改动。
+
 ## v0.1.1 (2026-08-24)
 
 ### 清理
