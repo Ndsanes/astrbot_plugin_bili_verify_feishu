@@ -14,15 +14,14 @@ admission — 深 module / 窄 interface / 高 depth
   - 防 gank 随机延迟
   - 拒绝理由与状态回写
 
-对外暴露（窄 interface，2 方法）：
-  AdmissionService.admit_request(req: JoinRequest) -> Decision
-  AdmissionService.admit_message(group_id, user_id, text, nickname) -> bool
+对外暴露（窄 interface，1 方法）：
+  AdmissionService.admit_request(req: JoinRequest) -> AdmissionResult
 
 设计取舍（leverage / locality / depth）：
-  - leverage：一个 interface，2+ 调用方（OneBot 事件、QQ 官方轮询、群消息补录）
+  - leverage：一个 interface，2 调用方（OneBot 事件、QQ 官方轮询）
   - locality：审批类 bug（UID 错提、飞书重试、重复放行）集中一处
-  - depth：interface 2 方法，实现吸收 5 个 wrapper + 2 个 adapter 差异
-  - seam：后依赖 MemberRegistry / AdmissionsStore / PluginConfig / PlatformPort 的 JoinRequest DTO；
+  - depth：interface 1 方法，实现吸收 5 个 wrapper 差异
+  - seam：后依赖 MemberRegistry / AdmissionsStore / PluginConfig / platform_port 的 DTO；
     删除测试：删掉本 module 会使 UID→Feishu→Approve 逻辑重新散回 main 的 5 处
 """
 from __future__ import annotations
@@ -71,8 +70,8 @@ class AdmissionService:
     """
     深 module：入群审批的单一决策面。
 
-    interface 窄（admit_request / admit_message），implementation 深（见模块 docstring）。
-    seam 之后隐藏：正则、随机延迟、MemberRegistry、AdmissionsStore、PlatformPort DTO。
+    interface 窄（admit_request），implementation 深（见模块 docstring）。
+    seam 之后隐藏：正则、随机延迟、MemberRegistry、AdmissionsStore、JoinRequest DTO。
     """
 
     def __init__(
@@ -100,7 +99,7 @@ class AdmissionService:
         """
         处理单条入群申请（JoinRequest），完成 UID 校验 → 飞书 → 决策。
 
-        调用方（PlatformPort 适配器或 OneBot 事件）只需传入归一后的 JoinRequest，
+        调用方（main 的 OneBot 事件 / QQ 官方轮询链路）只需传入归一后的 JoinRequest，
         无需知道飞书字段或状态机。
         """
         group = req.group_openid.strip()
@@ -153,45 +152,6 @@ class AdmissionService:
             )
             logger.warning(f"[Admission] 飞书写入失败已入 pending，仍放行 uid={uid} user={user}")
             return AdmissionResult(decision="approve", uid=uid, reason="feishu_pending")
-
-    async def admit_message(
-        self, group_id: str, user_id: str, text: str, nickname: str = ""
-    ) -> bool:
-        """
-        处理群内补录消息（qq_official @消息 或 aiocqhttp pending 校验后）。
-
-        无 join_request_id，不做审批，仅做落库；返回是否成功写入。
-        """
-        group = str(group_id or "").strip()
-        user = str(user_id or "").strip()
-        if not group or not self._store.is_whitelisted(group):
-            return False
-        # aiocqhttp 路径需要 pending 校验，qq_official 不需要——由 store 统一判断：
-        # pending 模式下未 pending 则忽略，store 可配置；此处按现有策略：
-        # 若 store 中无 pending 且为 aiocqhttp 场景，调用方应在外层已判断 is_pending
-        uid = _extract_uid(text or "")
-        if uid is None:
-            return False
-
-        await self._delay_if_needed()
-        ok = await self._registry.register(int(uid), user, nickname)
-        if ok:
-            self._store.discard_pending(group, user)
-            logger.info(f"[Admission] 群消息 UID 补录成功 group={group} user={user} uid={uid}")
-            return True
-        else:
-            self._store.enqueue_failed(
-                {
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "group_id": group,
-                    "user_id": user,
-                    "uid": uid,
-                    "nickname": nickname,
-                    "retry_count": 0,
-                }
-            )
-            logger.warning(f"[Admission] 群消息 UID 补录失败已入 pending uid={uid} user={user}")
-            return False
 
 
 __all__ = ["AdmissionService", "AdmissionResult", "JoinRequest"]

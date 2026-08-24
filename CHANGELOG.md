@@ -2,6 +2,15 @@
 
 本文件供 AstrBot 面板「插件更新日志」读取（`CHANGELOG.md`）。每次发版前更新对应条目。
 
+## v0.1.1 (2026-08-24)
+
+### 清理
+
+- 删除从未接线的深模块化重构残留：`platform_port.py` 仅保留 `JoinRequest` DTO（移除 PlatformPort 协议与 QqOfficialAdapter / OneBotAdapter 适配器）、`admission.admit_message`、`MemberRegistry.mark_left/find/from_plugin_config`、`storage.add_group_to_whitelist/remove_group_from_whitelist/clear_pending`、main 的 `_platform_port` 占位与 `_uid_pattern` 死正则。
+- 移除幽灵配置键 `FEISHU_QQ_FIELD` 读取；删除过时设计文档 `plan.md` 与 `tests/stubs/lark_oapi` 残留桩目录。
+- **【行为修正】** 未处理入群请求巡检间隔兜底默认值从 60s 统一为 3800s（与 `_conf_schema.json` / README 对齐，经 `plugin_config.PENDING_CHECK_INTERVAL_DEFAULT` 单点共享）。
+- `AdmissionsStore.clear_pending`（有测试覆盖的状态机方法）不受影响；bot 身份经 gateway.api() 的多维表格读写链路未改动。
+
 ## v0.1.0 (2026-08-24)
 
 ### 变更

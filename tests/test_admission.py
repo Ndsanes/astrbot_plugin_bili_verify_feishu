@@ -1,6 +1,6 @@
 """AdmissionService 决策域测试。
 
-覆盖 admit_request / admit_message 的每个 Decision 分支与 _extract_uid 纯函数。
+覆盖 admit_request 的每个 Decision 分支与 _extract_uid 纯函数。
 飞书经 FakeRegistry 替身注入，全程零网络。
 
 历史备注（两个疑似 bug 已于 v0.0.6 修复，用例改为断言正确语义）：
@@ -167,46 +167,6 @@ async def test_feishu失败仍放行并入补偿队列(tmp_path):
     assert pending[0]["uid"] == "100200300"
     assert pending[0]["retry_count"] == 0
     assert pending[0]["group_id"] == "g1"
-
-
-# --------------------------------------------------------------------------- #
-# admit_message — 群消息补录路径
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_admit_message_补录成功并discard_pending(tmp_path):
-    h = make_harness(tmp_path)
-    h.store.remember_pending("g1", "u1")
-
-    ok = await h.service.admit_message("g1", "u1", "UID 555000111", nickname="小明")
-
-    assert ok is True
-    assert h.registry.calls == [(555000111, "u1", "小明")]
-    assert not h.store.is_pending("g1", "u1")
-
-
-@pytest.mark.asyncio
-async def test_admit_message_白名单外返回False(tmp_path):
-    h = make_harness(tmp_path, groups=("g1",))
-    assert await h.service.admit_message("g-x", "u1", "123456789") is False
-    assert await h.service.admit_message("", "u1", "123456789") is False
-    assert h.registry.calls == []
-
-
-@pytest.mark.asyncio
-async def test_admit_message_无UID返回False(tmp_path):
-    h = make_harness(tmp_path)
-    assert await h.service.admit_message("g1", "u1", "不知道写啥") is False
-    assert h.registry.calls == []
-
-
-@pytest.mark.asyncio
-async def test_admit_message_飞书失败入队并返回False(tmp_path):
-    h = make_harness(tmp_path, registry=FakeRegistry(ok=False))
-    ok = await h.service.admit_message("g1", "u1", "999888777")
-    assert ok is False
-    assert [r["uid"] for r in h.store.list_pending()] == ["999888777"]
 
 
 # --------------------------------------------------------------------------- #

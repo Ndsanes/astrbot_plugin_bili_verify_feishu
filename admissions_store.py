@@ -21,7 +21,6 @@ admissions_store — 深 module / 窄 interface / 高 locality
   - locality：所有去重与 pending 变更在同一 module 内完成，测试时可
     通过 ``memory_only=True`` 或自定义 ``data_dir`` 以内存 fake 替代文件，
     无需触及 main.py。
-  - adapter 语义不在此 module，留给 PlatformPort；本 module 只做状态与持久化。
 """
 
 from __future__ import annotations

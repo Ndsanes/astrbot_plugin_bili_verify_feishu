@@ -75,6 +75,10 @@ def _as_list(v: Any) -> list[str]:
     return [s] if s else []
 
 
+# 巡检间隔的单一默认真相：_conf_schema.json、from_dict 与 main.py 兜底共用
+PENDING_CHECK_INTERVAL_DEFAULT = 3800
+
+
 @dataclass(frozen=True, slots=True)
 class FeishuCfg:
     # app_id/app_secret 已弃用：认证由 lark_cli 平台网关统一负责，键保留仅为兼容旧配置
@@ -86,7 +90,6 @@ class FeishuCfg:
     status_field: str = "状态"
     status_active: str = "在群"
     status_left: str = "已退群"
-    qq_field: str = "QQ号"
     max_retries: int = 3
     retry_delay: float = 1.0
 
@@ -161,13 +164,16 @@ class PluginConfig:
             status_field=str(raw.get("FEISHU_STATUS_FIELD", "状态") or "状态").strip(),
             status_active=str(raw.get("FEISHU_STATUS_ACTIVE_VALUE", "在群") or "在群").strip(),
             status_left=str(raw.get("FEISHU_STATUS_LEFT_VALUE", "已退群") or "已退群").strip(),
-            qq_field=str(raw.get("FEISHU_QQ_FIELD", "QQ号") or "QQ号").strip(),
             max_retries=_safe_int(raw.get("MAX_RETRIES", 3), 3, 1),
             retry_delay=_safe_float(raw.get("RETRY_DELAY", 1.0), 1.0, 0.0),
         )
         poll_interval = max(_safe_int(raw.get("QQOFFICIAL_POLL_INTERVAL", 30), 30, 10), 10)
         poll_limit = min(max(_safe_int(raw.get("QQOFFICIAL_POLL_LIMIT", 20), 20, 1), 1), 100)
-        pending_interval = _safe_int(raw.get("PENDING_CHECK_INTERVAL", 3800), 3800, 10)
+        pending_interval = _safe_int(
+            raw.get("PENDING_CHECK_INTERVAL", PENDING_CHECK_INTERVAL_DEFAULT),
+            PENDING_CHECK_INTERVAL_DEFAULT,
+            10,
+        )
         startup_limit = _safe_int(raw.get("STARTUP_REQUEST_SCAN_LIMIT", 50), 50, 1)
         poll = PollCfg(
             enabled=_safe_bool(raw.get("ENABLE_QQOFFICIAL_JOIN_POLL", True), True),
@@ -251,7 +257,6 @@ class PluginConfig:
             "FEISHU_STATUS_FIELD": self.feishu.status_field,
             "FEISHU_STATUS_ACTIVE_VALUE": self.feishu.status_active,
             "FEISHU_STATUS_LEFT_VALUE": self.feishu.status_left,
-            "FEISHU_QQ_FIELD": self.feishu.qq_field,
             "WHITELIST_GROUPS": list(self.whitelist.groups),
             "MAX_RETRIES": self.retry.max_retries,
             "RETRY_DELAY": self.retry.delay,
@@ -315,4 +320,5 @@ __all__ = [
     "_safe_int",
     "_safe_bool",
     "_safe_float",
+    "PENDING_CHECK_INTERVAL_DEFAULT",
 ]

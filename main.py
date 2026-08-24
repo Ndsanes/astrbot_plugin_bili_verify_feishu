@@ -29,14 +29,14 @@ try:
     from .admission import AdmissionService
     from .admissions_store import AdmissionsStore
     from .member_registry import MemberRegistry
-    from .platform_port import JoinRequest, OneBotAdapter, PlatformPort, QqOfficialAdapter
-    from .plugin_config import PluginConfig
+    from .platform_port import JoinRequest
+    from .plugin_config import PENDING_CHECK_INTERVAL_DEFAULT, PluginConfig
 except Exception:  # pragma: no cover - 离线测试回退
     AdmissionService = None  # type: ignore
     AdmissionsStore = None  # type: ignore
     MemberRegistry = None  # type: ignore
     JoinRequest = None  # type: ignore
-    PlatformPort = None  # type: ignore
+    PENDING_CHECK_INTERVAL_DEFAULT = 3800
     PluginConfig = None  # type: ignore
 
 
@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.1.0",
+    "0.1.1",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -54,9 +54,6 @@ class BiliVerifyFeishuPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._uid_pattern = re.compile(
-            r"(?:b站|bilibili|uid|UID)[：:\s]*(\d{4,})|^(\\d{6,})$"
-        )
         # 已入群但尚未提供 UID 的用户集合，格式: "{group_id}:{user_id}"
         self._pending_uid: set[str] = set()
         # 已在入群请求阶段完成 UID 校验，等待 group_increase 落地的用户。
@@ -74,7 +71,6 @@ class BiliVerifyFeishuPlugin(Star):
         self._admissions_store: Any | None = None
         self._member_registry: Any | None = None
         self._admission_service: Any | None = None
-        self._platform_port: Any | None = None  # PlatformPort interface，两个 adapter 复用同一 seam
         # qq_official 轮询：不可拉取群缓存（数字群号、UMO 全串、确认无 bot 关联的群）
         # 值为标记时间戳，超过 _QQOFFICIAL_INVALID_RETRY_SECONDS 自动过期重探，
         # 避免"当时无权限/未进群，之后才拉进群"被永久误判
@@ -186,9 +182,8 @@ class BiliVerifyFeishuPlugin(Star):
             if AdmissionsStore is not None:
                 self._admissions_store = AdmissionsStore()
             if MemberRegistry is not None:
-                # 优先用 typed config 的 feishu 段
+                # 用原始 dict 构造（字段名走 MemberRegistry 默认值）
                 cfg_for_registry = dict(self.config) if isinstance(self.config, dict) else {}
-                # 适配 MemberRegistry.from_plugin_config 也可
                 self._member_registry = MemberRegistry(cfg_for_registry)
             if (
                 AdmissionService is not None
@@ -201,16 +196,9 @@ class BiliVerifyFeishuPlugin(Star):
                     store=self._admissions_store,
                     config=self._typed_config,
                 )
-            # PlatformPort 按需实例化（两个 adapter 同一 seam）
-            if QqOfficialAdapter is not None and OneBotAdapter is not None:
-                # 仅作占位，实际 list/approve 时按平台选择 adapter
-                self._platform_port = {
-                    "qq_official": QqOfficialAdapter,
-                    "onebot": OneBotAdapter,
-                }
             logger.info(
                 "[BiliVerifyFeishu] 深 modules 已就绪："
-                "MemberRegistry / AdmissionsStore / AdmissionService / PlatformPort"
+                "MemberRegistry / AdmissionsStore / AdmissionService"
             )
         except Exception as e:
             logger.warning(f"[BiliVerifyFeishu] 深 modules 初始化失败，回落浅路径: {e}")
@@ -235,8 +223,8 @@ class BiliVerifyFeishuPlugin(Star):
         )
         if enable_pending_check:
             check_interval = self._safe_int(
-                self._get_config("PENDING_CHECK_INTERVAL", 60),
-                default=60,
+                self._get_config("PENDING_CHECK_INTERVAL", PENDING_CHECK_INTERVAL_DEFAULT),
+                default=PENDING_CHECK_INTERVAL_DEFAULT,
                 minimum=10,
             )
             self._pending_check_task = asyncio.create_task(
@@ -467,14 +455,12 @@ class BiliVerifyFeishuPlugin(Star):
             if isinstance(req, dict):
                 requests.append(dict(req))
 
-        return requests
-
     async def _resolve_nickname(
         self,
         user_id: str,
         event: AstrMessageEvent | None = None,
         raw: dict | None = None,
-    ) -> str:
+    ) -> str | None:
         """解析用户昵称：优先事件/原始字段，兜底查询。兼容 aiocqhttp 与 qq_official。"""
         # qq_official 路径：优先从 AstrMessageEvent 拿
         if event is not None:
@@ -528,7 +514,7 @@ class BiliVerifyFeishuPlugin(Star):
                         return str(payload.get("nickname", "")).strip()
             except Exception:
                 return ""
-        return
+        return None
 
     async def _deferred_startup_scan(self, limit: int):
         """延迟执行启动补偿扫描，等待平台适配器就绪。仅 aiocqhttp 支持。"""
@@ -617,21 +603,9 @@ class BiliVerifyFeishuPlugin(Star):
 
         # ---- QQ 官方机器人 (qq_official websocket) ----
         if platform_name == "qq_official":
-            # 官方机器人仅支持群 @消息 / 私聊，无法拦截入群请求与成员增减
-            # 入群后用户在群内发送 UID 即触发登记
-            # AstrBot 已将 qq_official 的群消息映射为 GROUP_MESSAGE
-            # 兜底按群消息处理
-            with contextlib.suppress(Exception):
-                pass
-            # 无 raw dict 时直接按群消息处理
-            if raw is None:
-                await self._on_group_message_qq_official(event)
-                return
-            # 若 raw 为 botpy 对象，转为群消息处理
-            if not isinstance(raw, dict):
-                await self._on_group_message_qq_official(event)
-                return
-            # 兼容极少数情况下 raw 仍为 dict 的场景
+            # 官方机器人仅支持群 @消息 / 私聊，无法拦截入群请求与成员增减；
+            # 入群后用户在群内发送 UID 即触发登记。AstrBot 已将 qq_official
+            # 的群消息映射为 GROUP_MESSAGE，无论 raw 形态均按群消息处理。
             await self._on_group_message_qq_official(event)
             return
 
@@ -670,7 +644,7 @@ class BiliVerifyFeishuPlugin(Star):
         self,
         uid_num: int,
         qq_num: int | str,
-        nickname: str,
+        nickname: str | None,
         time_ms: int,
     ) -> dict[str, Any]:
         """构造入群登记写入字段，包含成员状态。兼容 qq_official 的 openid 字符串。"""
@@ -685,7 +659,7 @@ class BiliVerifyFeishuPlugin(Star):
         return {
             "UID": uid_num,
             "QQ号": qq_value,
-            "昵称": nickname,
+            "昵称": str(nickname or "").strip(),
             "时间": time_ms,
             status_field: active_value,
         }

@@ -57,26 +57,6 @@ def is_group_whitelisted(group_id: str) -> bool:
     return group_id in whitelist
 
 
-def add_group_to_whitelist(group_id: str) -> bool:
-    """添加群到白名单，已存在返回 False。"""
-    whitelist = load_whitelist()
-    if group_id in whitelist:
-        return False
-    whitelist.append(group_id)
-    save_whitelist(whitelist)
-    return True
-
-
-def remove_group_from_whitelist(group_id: str) -> bool:
-    """从白名单移除群，不存在返回 False。"""
-    whitelist = load_whitelist()
-    if group_id not in whitelist:
-        return False
-    whitelist.remove(group_id)
-    save_whitelist(whitelist)
-    return True
-
-
 # ---- 待处理队列操作 ----
 
 
@@ -93,7 +73,7 @@ def load_pending() -> list[dict]:
         return []
 
 
-def save_pending(records: list[dict]) -> None:
+def _save_pending(records: list[dict]) -> None:
     """保存待处理队列。"""
     _atomic_write(PENDING_FILE, {"records": records})
 
@@ -102,9 +82,6 @@ def add_to_pending(record: dict) -> None:
     """添加记录到待处理队列。"""
     records = load_pending()
     records.append(record)
-    save_pending(records)
+    _save_pending(records)
 
 
-def clear_pending() -> None:
-    """清空待处理队列。"""
-    save_pending([])
