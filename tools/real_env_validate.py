@@ -1,19 +1,23 @@
+"""real_env_validate — 校验 .env / 环境变量中的业务配置是否齐全。
+
+网关化改造后，认证、登录态、TAT 刷新与限速全部由 lark_cli 平台网关负责，
+本插件不再自持凭据，本工具也只做本地配置校验，不发起真实写入。
+"""
+
+from __future__ import annotations
+
 import argparse
-import asyncio
 import os
 import sys
-import time
-from datetime import datetime, timezone
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 REQUIRED_KEYS = [
-    "FEISHU_APP_ID",
-    "FEISHU_APP_SECRET",
     "FEISHU_APP_TOKEN",
     "FEISHU_TABLE_ID",
 ]
@@ -71,65 +75,14 @@ def validate_format_warnings(config: Mapping[str, Any]) -> list[str]:
     return warnings
 
 
-def make_fields(index: int) -> dict[str, str | int]:
-    """构造一条用于验证的测试记录。"""
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    uid = str(now_ms)[-10:] + f"{index:02d}"
-    return {
-        "UID": int(uid),
-        "QQ号": 70000000 + index,
-        "昵称": "env_validate",
-        "时间": now_ms,
-    }
-
-
-async def run_write_validation(config: Mapping[str, Any], count: int) -> int:
-    """执行真实写入验证，返回失败条数。"""
-    try:
-        from feishu_client import append_row_with_retry
-    except ModuleNotFoundError as e:
-        print(f"dependency missing: {e}")
-        print(
-            "please install required package in runtime environment, e.g. pip install lark-oapi"
-        )
-        return count
-
-    failures = 0
-    begin = time.perf_counter()
-
-    for idx in range(count):
-        fields = make_fields(idx)
-        ok = await append_row_with_retry(fields=fields, config=config)
-        if ok:
-            print(f"[{idx + 1}/{count}] write ok, UID={fields['UID']}")
-        else:
-            failures += 1
-            print(f"[{idx + 1}/{count}] write failed, UID={fields['UID']}")
-
-    elapsed = time.perf_counter() - begin
-    print(f"done: total={count}, failures={failures}, elapsed={elapsed:.2f}s")
-    return failures
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate Feishu real environment by .env config"
+        description="Validate bili_verify local .env config (gateway mode)"
     )
     parser.add_argument(
         "--env-file",
         default=".env",
         help="Path to .env file (default: .env)",
-    )
-    parser.add_argument(
-        "--write",
-        action="store_true",
-        help="Really write records to Feishu table",
-    )
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=3,
-        help="Number of records to write when --write is enabled (default: 3)",
     )
     return parser.parse_args()
 
@@ -150,14 +103,8 @@ def main() -> int:
     for warning in validate_format_warnings(config):
         print(f"config warning: {warning}")
 
-    if not args.write:
-        print("dry run mode: no records written")
-        print("run with --write to execute real Feishu writes")
-        return 0
-
-    count = max(1, args.count)
-    failures = asyncio.run(run_write_validation(config=config, count=count))
-    return 1 if failures else 0
+    print("认证由 lark_cli 平台网关统一负责；如需验证链路，请在 AstrBot 实例内观察网关日志")
+    return 0
 
 
 if __name__ == "__main__":

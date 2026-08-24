@@ -26,6 +26,7 @@ admissions_store — 深 module / 窄 interface / 高 locality
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -98,8 +99,16 @@ class AdmissionsStore:
                 # 显式指定文件时，data_dir 仅用于 _ensure_data_dir 的兜底
                 base = Path(data_dir) if data_dir is not None else _default_data_dir()
                 self._data_dir = base
-                self._whitelist_file = Path(whitelist_file) if whitelist_file is not None else base / "whitelist.json"
-                self._pending_file = Path(pending_file) if pending_file is not None else base / "pending.json"
+                self._whitelist_file = (
+                    Path(whitelist_file)
+                    if whitelist_file is not None
+                    else base / "whitelist.json"
+                )
+                self._pending_file = (
+                    Path(pending_file)
+                    if pending_file is not None
+                    else base / "pending.json"
+                )
             else:
                 base = Path(data_dir) if data_dir is not None else _default_data_dir()
                 self._data_dir = base
@@ -131,11 +140,9 @@ class AdmissionsStore:
     def _ensure_data_dir(self) -> None:
         if self._memory_only or self._data_dir is None:
             return
-        try:
+        # 目录创建失败交由上层写入时报错，不在此处抛
+        with contextlib.suppress(Exception):
             self._data_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            # 目录创建失败交由上层写入时报错， 不在此处抛
-            pass
 
     def _atomic_write(self, filepath: Path, data: dict[str, Any]) -> None:
         """原子写入：mkstemp(dir=DATA_DIR) + os.replace，crash-safe。"""
@@ -144,11 +151,13 @@ class AdmissionsStore:
             return
         self._ensure_data_dir()
         # 临时文件落在同目录，保证 rename 原子性（同文件系统）
-        dir_for_tmp = filepath.parent if filepath.parent.exists() else (self._data_dir or Path.cwd())
-        try:
+        dir_for_tmp = (
+            filepath.parent
+            if filepath.parent.exists()
+            else (self._data_dir or Path.cwd())
+        )
+        with contextlib.suppress(Exception):
             dir_for_tmp.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
         fd, tmp_path = tempfile.mkstemp(dir=str(dir_for_tmp), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -156,10 +165,8 @@ class AdmissionsStore:
             os.replace(tmp_path, filepath)
         except Exception:
             if os.path.exists(tmp_path):
-                try:
+                with contextlib.suppress(Exception):
                     os.unlink(tmp_path)
-                except Exception:
-                    pass
             raise
 
     # ---- whitelist 文件 seam ----

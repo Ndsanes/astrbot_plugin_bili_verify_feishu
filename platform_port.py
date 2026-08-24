@@ -29,10 +29,11 @@ platform_port.py — PlatformPort seam / adapter / depth
 """
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 try:
     from astrbot.api import logger as _astr_logger  # type: ignore
@@ -54,7 +55,8 @@ class JoinRequest:
         join_request_id: QQ 官方返回的 join_request_id；OneBot 侧复用 flag/request_id
         member_openid: 申请人 openid / user_id（统一为 str，数字 QQ 也转 str）
         username: 申请人昵称（可能为空，resolve_nickname 可二次解析）
-        comment: 校验信息（QQ 官方 verify_info.verify_message 与 review_qa_list 拼接；OneBot 侧 comment/message）
+        comment: 校验信息（QQ 官方 verify_info.verify_message 与 review_qa_list
+            拼接；OneBot 侧 comment/message）
         raw: 原始条目，便于透传 sub_type / verify_info 等
     """
 
@@ -129,7 +131,8 @@ def _to_str(v: Any) -> str:
 
 
 def _build_qq_comment(verify_info: Any) -> str:
-    """从 QQ 官方 verify_info 提取 comment：verify_message 优先，否则拼接 review_qa_list[].answer。"""
+    """从 QQ 官方 verify_info 提取 comment：verify_message 优先，否则拼接
+    review_qa_list[].answer。"""
     if not isinstance(verify_info, dict):
         return ""
     msg = _to_str(verify_info.get("verify_message"))
@@ -168,9 +171,8 @@ def _extract_onebot_requests(payload: Any) -> list[dict[str, Any]]:
             item.setdefault("sub_type", "invite")
             out.append(item)
     for req in data.get("requests", []) or []:
-        if isinstance(req, dict):
-            if req not in out:
-                out.append(dict(req))
+        if isinstance(req, dict) and req not in out:
+            out.append(dict(req))
     # 兜底：某些实现直接返回 list
     if not out and isinstance(data.get("list"), list):
         for req in data.get("list", []):
@@ -247,7 +249,7 @@ class QqOfficialAdapter:
         if hasattr(client, "request"):
             return client
         if hasattr(getattr(client, "api", None), "request"):
-            return getattr(client, "api")
+            return client.api
         return None
 
     # -- PlatformPort interface -------------------------------------------
@@ -280,12 +282,12 @@ class QqOfficialAdapter:
             return [], ""
 
         # seam: 30QPM 查询限流点
-        try:
+        with contextlib.suppress(Exception):
             await self._limiter.acquire("list")
-        except Exception:
-            pass
 
-        route = Route("GET", "/v2/groups/{group_openid}/join_request_list", group_openid=group_openid)
+        route = Route(
+            "GET", "/v2/groups/{group_openid}/join_request_list", group_openid=group_openid
+        )
         params: dict[str, Any] = {}
         if cursor:
             params["cursor"] = cursor
@@ -330,7 +332,9 @@ class QqOfficialAdapter:
             comment = _build_qq_comment(verify_info)
             # 兜底：某些版本直接顶层带 verify_message
             if not comment:
-                comment = _to_str(entry.get("verify_message") or entry.get("comment") or entry.get("message"))
+                comment = _to_str(
+                    entry.get("verify_message") or entry.get("comment") or entry.get("message")
+                )
             items.append(
                 JoinRequest(
                     join_request_id=jid,
@@ -375,10 +379,8 @@ class QqOfficialAdapter:
             return False
 
         # seam: 60QPM 审批限流点
-        try:
+        with contextlib.suppress(Exception):
             await self._limiter.acquire("approve")
-        except Exception:
-            pass
 
         route = Route(
             "POST",
@@ -413,7 +415,9 @@ class QqOfficialAdapter:
         approve: bool,
         reject_reason: str = "",
     ) -> bool:
-        return await self.approve_join_request(group_openid, member_openid, join_request_id, approve, reject_reason)
+        return await self.approve_join_request(
+            group_openid, member_openid, join_request_id, approve, reject_reason
+        )
 
     async def resolve_nickname(
         self,
@@ -421,7 +425,7 @@ class QqOfficialAdapter:
         event: Any | None = None,
         raw: dict[str, Any] | None = None,
     ) -> str:
-        uid = _to_str(user_id)
+        _to_str(user_id)
         # 1) AstrMessageEvent 优先
         if event is not None:
             try:
@@ -537,10 +541,8 @@ class OneBotAdapter:
             logger.debug("[PlatformPort][onebot] list: no client")
             return [], ""
 
-        try:
+        with contextlib.suppress(Exception):
             await self._limiter.acquire("list")
-        except Exception:
-            pass
 
         try:
             ret = await client.api.call_action("get_group_system_msg")  # type: ignore[attr-defined]
@@ -566,9 +568,15 @@ class OneBotAdapter:
 
         items: list[JoinRequest] = []
         for req in page:
-            # OneBot 字段归一：flag/request_id -> join_request_id, user_id/requester_uin -> member_openid
+            # OneBot 字段归一：flag/request_id -> join_request_id,
+            # user_id/requester_uin -> member_openid
             jid = _to_str(req.get("flag") or req.get("request_id") or req.get("join_request_id"))
-            mid = _to_str(req.get("user_id") or req.get("requester_uin") or req.get("invitor_uin") or req.get("member_openid"))
+            mid = _to_str(
+                req.get("user_id")
+                or req.get("requester_uin")
+                or req.get("invitor_uin")
+                or req.get("member_openid")
+            )
             if not jid or not mid:
                 continue
             # 数字 QQ 转 str 已在 _to_str 完成
@@ -580,7 +588,9 @@ class OneBotAdapter:
                 or req.get("username")
                 or ""
             )
-            comment = _to_str(req.get("comment") or req.get("message") or req.get("verify_message") or "")
+            comment = _to_str(
+                req.get("comment") or req.get("message") or req.get("verify_message") or ""
+            )
             # 若 raw 含 verify_info 也尝试拼接（兼容）
             if not comment and isinstance(req.get("verify_info"), dict):
                 comment = _build_qq_comment(req.get("verify_info"))
@@ -616,10 +626,8 @@ class OneBotAdapter:
             logger.error("[PlatformPort][onebot] approve: no client")
             return False
 
-        try:
+        with contextlib.suppress(Exception):
             await self._limiter.acquire("approve")
-        except Exception:
-            pass
 
         # 尝试从 raw 推断 sub_type，默认 add
         sub_type = "add"
@@ -635,7 +643,10 @@ class OneBotAdapter:
 
         try:
             ret = await client.api.call_action("set_group_add_request", **payload)  # type: ignore[attr-defined]
-            logger.info(f"[PlatformPort][onebot] approve: approve={approve} flag={join_request_id} ret={ret}")
+            logger.info(
+                f"[PlatformPort][onebot] approve: approve={approve} "
+                f"flag={join_request_id} ret={ret}"
+            )
             return True
         except Exception as e:
             logger.error(f"[PlatformPort][onebot] approve failed: {e}")
@@ -649,7 +660,9 @@ class OneBotAdapter:
         approve: bool,
         reject_reason: str = "",
     ) -> bool:
-        return await self.approve_join_request(group_openid, member_openid, join_request_id, approve, reject_reason)
+        return await self.approve_join_request(
+            group_openid, member_openid, join_request_id, approve, reject_reason
+        )
 
     async def resolve_nickname(
         self,

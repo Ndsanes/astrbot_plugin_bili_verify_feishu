@@ -1,25 +1,27 @@
 import asyncio
+import contextlib
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
 
 from .feishu_client import (
     broadcast_feishu_message,
-    upsert_member_row_by_qq_with_retry,
+    set_gateway,
     update_member_status_by_qq_with_retry,
+    upsert_member_row_by_qq_with_retry,
 )
 from .storage import (
-    is_group_whitelisted,
-    load_whitelist,
-    load_pending,
-    save_whitelist,
     add_to_pending,
+    is_group_whitelisted,
+    load_pending,
+    load_whitelist,
+    save_whitelist,
 )
 
 # 深 modules — narrow interface behind seam（admission 整合后逐步收口）
@@ -42,7 +44,7 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.0.7",
+    "0.1.0",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -114,12 +116,21 @@ class BiliVerifyFeishuPlugin(Star):
             return default
         return max(parsed, minimum)
 
+    def _get_lark_gateway(self):
+        """返回 lark_cli 平台适配器实例；未加载时返回 None（飞书调用优雅降级）。"""
+        try:
+            for p in self.context.platform_manager.get_insts():
+                if p.meta().name == "lark_cli":
+                    return p
+        except Exception:
+            pass
+        return None
+
+
     def _validate_config(self) -> list[str]:
         """校验必填配置项是否完整。"""
         errors: list[str] = []
         required = [
-            "FEISHU_APP_ID",
-            "FEISHU_APP_SECRET",
             "FEISHU_APP_TOKEN",
             "FEISHU_TABLE_ID",
         ]
@@ -149,7 +160,16 @@ class BiliVerifyFeishuPlugin(Star):
 
     async def initialize(self):
         """插件初始化，加载配置并校验。"""
-        self._init_whitelist_from_config()
+        # 注入 lark_cli 平台网关：认证/登录态/TAT 刷新/限速全部由网关单点负责
+        gateway = self._get_lark_gateway()
+        set_gateway(gateway)
+        if gateway is None:
+            logger.warning(
+                "[BiliVerifyFeishu] 未找到 lark_cli 平台适配器，"
+                "其加载前飞书写入/通知将降级失败"
+            )
+        else:
+            logger.info("[BiliVerifyFeishu] 已接入 lark_cli 平台网关")
         errors = self._validate_config()
         if errors:
             for err in errors:
@@ -160,7 +180,9 @@ class BiliVerifyFeishuPlugin(Star):
         # 初始化深 modules（失败则回落到原浅路径，保持兼容）
         try:
             if PluginConfig is not None:
-                self._typed_config = PluginConfig.from_dict(dict(self.config) if isinstance(self.config, dict) else {})
+                self._typed_config = PluginConfig.from_dict(
+                    dict(self.config) if isinstance(self.config, dict) else {}
+                )
             if AdmissionsStore is not None:
                 self._admissions_store = AdmissionsStore()
             if MemberRegistry is not None:
@@ -168,7 +190,12 @@ class BiliVerifyFeishuPlugin(Star):
                 cfg_for_registry = dict(self.config) if isinstance(self.config, dict) else {}
                 # 适配 MemberRegistry.from_plugin_config 也可
                 self._member_registry = MemberRegistry(cfg_for_registry)
-            if AdmissionService is not None and self._member_registry is not None and self._admissions_store is not None and self._typed_config is not None:
+            if (
+                AdmissionService is not None
+                and self._member_registry is not None
+                and self._admissions_store is not None
+                and self._typed_config is not None
+            ):
                 self._admission_service = AdmissionService(
                     registry=self._member_registry,
                     store=self._admissions_store,
@@ -181,7 +208,10 @@ class BiliVerifyFeishuPlugin(Star):
                     "qq_official": QqOfficialAdapter,
                     "onebot": OneBotAdapter,
                 }
-            logger.info("[BiliVerifyFeishu] 深 modules 已就绪：MemberRegistry / AdmissionsStore / AdmissionService / PlatformPort")
+            logger.info(
+                "[BiliVerifyFeishu] 深 modules 已就绪："
+                "MemberRegistry / AdmissionsStore / AdmissionService / PlatformPort"
+            )
         except Exception as e:
             logger.warning(f"[BiliVerifyFeishu] 深 modules 初始化失败，回落浅路径: {e}")
 
@@ -233,7 +263,10 @@ class BiliVerifyFeishuPlugin(Star):
             self._qqofficial_poll_task = asyncio.create_task(
                 self._qqofficial_join_poll_loop(poll_interval)
             )
-            logger.info(f"[BiliVerifyFeishu] 已启动QQ官方入群申请轮询，间隔: {poll_interval}s（仅 qq_official 生效，aiocqhttp 下空转）")
+            logger.info(
+                f"[BiliVerifyFeishu] 已启动QQ官方入群申请轮询，间隔: {poll_interval}s"
+                "（仅 qq_official 生效，aiocqhttp 下空转）"
+            )
         else:
             logger.info("[BiliVerifyFeishu] QQ官方入群申请轮询已关闭")
 
@@ -250,7 +283,10 @@ class BiliVerifyFeishuPlugin(Star):
             elif isinstance(raw_targets, str):
                 has_targets = bool(raw_targets.strip())
             if not has_targets:
-                logger.warning("[BiliVerifyFeishu] 已启用掉线检测但未配置 OFFLINE_FEISHU_TARGETS，掉线时仅记录日志")
+                logger.warning(
+                    "[BiliVerifyFeishu] 已启用掉线检测但未配置 OFFLINE_FEISHU_TARGETS"
+                    "，掉线时仅记录日志"
+                )
             offline_interval = self._safe_int(
                 self._get_config("OFFLINE_CHECK_INTERVAL", 60),
                 default=60,
@@ -259,7 +295,9 @@ class BiliVerifyFeishuPlugin(Star):
             self._offline_monitor_task = asyncio.create_task(
                 self._offline_monitor_loop(offline_interval)
             )
-            logger.info(f"[BiliVerifyFeishu] 已启动QQ掉线检测任务，间隔: {offline_interval}s（飞书通知）")
+            logger.info(
+                f"[BiliVerifyFeishu] 已启动QQ掉线检测任务，间隔: {offline_interval}s（飞书通知）"
+            )
         else:
             logger.info("[BiliVerifyFeishu] QQ掉线检测（飞书通知）已关闭")
 
@@ -314,7 +352,9 @@ class BiliVerifyFeishuPlugin(Star):
         # 补偿扫描：尝试拉取 get_group_system_msg 处理掉线期间积压的请求
         # 避免与启动扫描和掉线恢复扫描重复，用 _processed_request_keys 去重
         try:
-            limit = self._safe_int(self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50), default=50, minimum=1)
+            limit = self._safe_int(
+                self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50), default=50, minimum=1
+            )
             await self._scan_unhandled_group_requests_on_startup(limit)
         except Exception as e:
             logger.debug(f"[BiliVerifyFeishu] 周期补偿扫描失败: {e}")
@@ -488,12 +528,15 @@ class BiliVerifyFeishuPlugin(Star):
                         return str(payload.get("nickname", "")).strip()
             except Exception:
                 return ""
-        return 
+        return
 
     async def _deferred_startup_scan(self, limit: int):
         """延迟执行启动补偿扫描，等待平台适配器就绪。仅 aiocqhttp 支持。"""
         if not self._has_aiocqhttp():
-            logger.info("[BiliVerifyFeishu] 未检测到 aiocqhttp 平台，跳过启动补偿扫描（qq_official 不支持入群审批）")
+            logger.info(
+                "[BiliVerifyFeishu] 未检测到 aiocqhttp 平台，跳过启动补偿扫描"
+                "（qq_official 不支持入群审批）"
+            )
             return
         for _ in range(6):
             await asyncio.sleep(1)
@@ -577,12 +620,9 @@ class BiliVerifyFeishuPlugin(Star):
             # 官方机器人仅支持群 @消息 / 私聊，无法拦截入群请求与成员增减
             # 入群后用户在群内发送 UID 即触发登记
             # AstrBot 已将 qq_official 的群消息映射为 GROUP_MESSAGE
-            try:
-                msg_type = event.message_obj.type
-                from astrbot.api.platform import MessageType as _MT
-                is_group = (msg_type == _MT.GROUP_MESSAGE)
-            except Exception:
-                is_group = True  # 兜底按群消息处理
+            # 兜底按群消息处理
+            with contextlib.suppress(Exception):
+                pass
             # 无 raw dict 时直接按群消息处理
             if raw is None:
                 await self._on_group_message_qq_official(event)
@@ -687,14 +727,21 @@ class BiliVerifyFeishuPlugin(Star):
     async def _on_group_request(self, event: AstrMessageEvent | None, raw: dict):
         """处理加群请求事件（request_type=group）。"""
         # 防 gank：随机延迟后再处理，避免被批量请求打爆飞书限流
-        delay_min = self._safe_float(self._get_config("REQUEST_DELAY_MIN_SECONDS", 10.0), default=10.0, minimum=0.0)
-        delay_max = self._safe_float(self._get_config("REQUEST_DELAY_MAX_SECONDS", 60.0), default=60.0, minimum=0.0)
+        delay_min = self._safe_float(
+            self._get_config("REQUEST_DELAY_MIN_SECONDS", 10.0), default=10.0, minimum=0.0
+        )
+        delay_max = self._safe_float(
+            self._get_config("REQUEST_DELAY_MAX_SECONDS", 60.0), default=60.0, minimum=0.0
+        )
         if delay_max < delay_min:
             delay_max = delay_min
         if delay_min > 0 or delay_max > 0:
             delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
             if delay > 0:
-                logger.debug(f"[BiliVerifyFeishu] 入群请求随机延迟 {delay:.2f}s: group={raw.get('group_id')}, user={raw.get('user_id')}")
+                logger.debug(
+                    f"[BiliVerifyFeishu] 入群请求随机延迟 {delay:.2f}s:"
+                    f" group={raw.get('group_id')}, user={raw.get('user_id')}"
+                )
                 await asyncio.sleep(delay)
 
         group_id = str(raw.get("group_id", ""))
@@ -744,7 +791,7 @@ class BiliVerifyFeishuPlugin(Star):
                 qq_key = int(user_id)
             except ValueError:
                 qq_key = user_id
-        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000)
         nickname = await self._resolve_nickname(user_id=user_id, event=event, raw=raw)
 
         fields = self._build_fields_for_join(
@@ -781,7 +828,7 @@ class BiliVerifyFeishuPlugin(Star):
             )
             add_to_pending(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group_id,
                     "user_id": user_id,
                     "uid": uid,
@@ -791,7 +838,8 @@ class BiliVerifyFeishuPlugin(Star):
             )
             # 飞书不可达时不拒绝用户，先放行并入待处理队列，后续由巡检/重连扫描补偿
             logger.warning(
-                f"[BiliVerifyFeishu] 飞书写入失败但仍放行用户，待后续补偿: UID={uid}, QQ={user_id}, 群={group_id}"
+                f"[BiliVerifyFeishu] 飞书写入失败但仍放行用户，待后续补偿:"
+                f" UID={uid}, QQ={user_id}, 群={group_id}"
             )
             await self._set_group_add_request(
                 event,
@@ -904,7 +952,7 @@ class BiliVerifyFeishuPlugin(Star):
                 qq_key2 = int(user_id)
             except ValueError:
                 qq_key2 = user_id
-        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000)
 
         # 构造写入飞书的字段数据
         fields = self._build_fields_for_join(
@@ -931,7 +979,7 @@ class BiliVerifyFeishuPlugin(Star):
             # 写入失败时加入待处理队列
             add_to_pending(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group_id,
                     "user_id": user_id,
                     "uid": uid,
@@ -978,7 +1026,8 @@ class BiliVerifyFeishuPlugin(Star):
 
         nickname = await self._resolve_nickname(user_id=user_id, event=event, raw=None)
         logger.info(
-            f"[BiliVerifyFeishu][qq_official] 提取到 UID: {uid}, 用户: {user_id}({nickname}), 群: {group_id}"
+            f"[BiliVerifyFeishu][qq_official] 提取到 UID: {uid}, 用户:"
+            f" {user_id}({nickname}), 群: {group_id}"
         )
 
         uid_num = int(uid)
@@ -988,7 +1037,7 @@ class BiliVerifyFeishuPlugin(Star):
                 qq_key = int(user_id)
             except ValueError:
                 qq_key = user_id
-        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000)
 
         fields = self._build_fields_for_join(
             uid_num=uid_num,
@@ -1008,11 +1057,12 @@ class BiliVerifyFeishuPlugin(Star):
             logger.info(f"[BiliVerifyFeishu][qq_official] 飞书写入成功: UID={uid}, QQ={user_id}")
         else:
             logger.error(
-                f"[BiliVerifyFeishu][qq_official] 飞书写入失败，已加入待处理队列: UID={uid}, QQ={user_id}"
+                f"[BiliVerifyFeishu][qq_official] 飞书写入失败，已加入待处理队列:"
+                f" UID={uid}, QQ={user_id}"
             )
             add_to_pending(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group_id,
                     "user_id": user_id,
                     "uid": uid,
@@ -1049,7 +1099,8 @@ class BiliVerifyFeishuPlugin(Star):
         """探测 QQ 是否在线。兼容 aiocqhttp (OneBot) 与 qq_official。
 
         - aiocqhttp: 通过 get_status / ws 客户端存在性判断
-        - qq_official: 通过 get_platform 存活性 + botpy 客户端是否关闭判断（官方 WS 掉线时平台仍在但 client.is_closed）
+        - qq_official: 通过 get_platform 存活性 + botpy 客户端是否关闭判断
+          （官方 WS 掉线时平台仍在但 client.is_closed）
         """
         # 优先尝试 aiocqhttp 路径
         if self._has_aiocqhttp():
@@ -1060,9 +1111,13 @@ class BiliVerifyFeishuPlugin(Star):
             try:
                 api_clients = getattr(client, "_wsr_api_clients", None)
                 event_clients = getattr(client, "_wsr_event_clients", None)
-                if isinstance(api_clients, dict) and isinstance(event_clients, set):
-                    if not api_clients and not event_clients:
-                        return False
+                if (
+                    isinstance(api_clients, dict)
+                    and isinstance(event_clients, set)
+                    and not api_clients
+                    and not event_clients
+                ):
+                    return False
             except Exception:
                 pass
             try:
@@ -1126,11 +1181,17 @@ class BiliVerifyFeishuPlugin(Star):
                         self._offline_is_down = False
                         self._offline_fail_count = 0
                         logger.info("[BiliVerifyFeishu] QQ已恢复在线，执行补偿扫描")
-                        if self._safe_bool(self._get_config("OFFLINE_RECOVERY_NOTIFY", True), default=True):
+                        if self._safe_bool(
+                            self._get_config("OFFLINE_RECOVERY_NOTIFY", True), default=True
+                        ):
                             await self._notify_recovery_via_feishu()
                         # 补偿扫描掉线期间积压的加群请求
                         try:
-                            limit = self._safe_int(self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50), default=50, minimum=1)
+                            limit = self._safe_int(
+                                self._get_config("STARTUP_REQUEST_SCAN_LIMIT", 50),
+                                default=50,
+                                minimum=1,
+                            )
                             await self._scan_unhandled_group_requests_on_startup(limit)
                         except Exception as e:
                             logger.warning(f"[BiliVerifyFeishu] 恢复后补偿扫描失败: {e}")
@@ -1153,7 +1214,7 @@ class BiliVerifyFeishuPlugin(Star):
 
     async def _notify_offline_via_feishu(self):
         """通过飞书发送掉线告警。"""
-        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         whitelist = load_whitelist()
         pending_cnt = len([k for k in self._pending_uid if k.split(":", 1)[0] in set(whitelist)])
         content = (
@@ -1173,7 +1234,7 @@ class BiliVerifyFeishuPlugin(Star):
 
     async def _notify_recovery_via_feishu(self):
         """通过飞书发送恢复通知。"""
-        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        ts = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         content = f"✅ QQ机器人已恢复在线\n时间: {ts}\n"
         try:
             await broadcast_feishu_message(content=content, config=self.config)
@@ -1307,18 +1368,26 @@ class BiliVerifyFeishuPlugin(Star):
             logger.warning("[BiliVerifyFeishu] 无法获取 qq_official http 客户端")
             return
 
-        poll_limit = self._safe_int(self._get_config("QQOFFICIAL_POLL_LIMIT", 20), default=20, minimum=1)
+        poll_limit = self._safe_int(
+            self._get_config("QQOFFICIAL_POLL_LIMIT", 20), default=20, minimum=1
+        )
         poll_limit = min(poll_limit, 100)
         cursor = ""
         # 随机延迟复用现有配置，防 gank
-        delay_min = self._safe_float(self._get_config("REQUEST_DELAY_MIN_SECONDS", 0), default=0, minimum=0.0)
-        delay_max = self._safe_float(self._get_config("REQUEST_DELAY_MAX_SECONDS", 0), default=0, minimum=0.0)
+        delay_min = self._safe_float(
+            self._get_config("REQUEST_DELAY_MIN_SECONDS", 0), default=0, minimum=0.0
+        )
+        delay_max = self._safe_float(
+            self._get_config("REQUEST_DELAY_MAX_SECONDS", 0), default=0, minimum=0.0
+        )
         # 限制单次轮询最大页数防止死循环
         max_pages = 5
         pages = 0
         while pages < max_pages:
             pages += 1
-            route = Route("GET", "/v2/groups/{group_openid}/join_request_list", group_openid=group_openid)
+            route = Route(
+                "GET", "/v2/groups/{group_openid}/join_request_list", group_openid=group_openid
+            )
             # 请求参数：cursor/limit 官方文档定义在请求体，但 botpy 的 GET 需用 params
             params: dict[str, str | int] = {}
             if cursor:
@@ -1337,13 +1406,19 @@ class BiliVerifyFeishuPlugin(Star):
                     ret = await http.request(route, json=params if params else None)
                 except Exception as e:
                     msg = str(e)
-                    logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
+                    logger.debug(
+                        f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid}"
+                        f" cursor={cursor}: {msg}"
+                    )
                     if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
                         return "not_related"
                     return
             except Exception as e:
                 msg = str(e)
-                logger.debug(f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid} cursor={cursor}: {msg}")
+                logger.debug(
+                    f"[BiliVerifyFeishu] 请求入群列表失败 {group_openid}"
+                    f" cursor={cursor}: {msg}"
+                )
                 if ("资源不存在" in msg) or ("replace query param" in msg) or ("注销" in msg):
                     return "not_related"
                 return
@@ -1379,7 +1454,8 @@ class BiliVerifyFeishuPlugin(Star):
                 self._processed_request_keys.add(req_key)
 
                 # 提取校验信息：verify_message 或 review_qa_list
-                verify_info = item.get("verify_info", {}) if isinstance(item.get("verify_info", {}), dict) else {}
+                raw_verify_info = item.get("verify_info", {})
+                verify_info = raw_verify_info if isinstance(raw_verify_info, dict) else {}
                 comment = str(verify_info.get("verify_message", "") or "").strip()
                 if not comment:
                     # 兼容问答模式：拼接所有答案
@@ -1425,7 +1501,8 @@ class BiliVerifyFeishuPlugin(Star):
         comment: str,
         raw_item: dict,
     ):
-        """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。优先走深 AdmissionService seam。"""
+        """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。
+        优先走深 AdmissionService seam。"""
         # 深路径：通过 AdmissionService 统一决策与落库（窄 interface）
         if self._admission_service is not None and JoinRequest is not None:
             try:
@@ -1466,13 +1543,18 @@ class BiliVerifyFeishuPlugin(Star):
                 logger.warning(f"[BiliVerifyFeishu] 深 Admission 路径失败，回落浅路径: {e}")
 
         if not is_group_whitelisted(group_openid):
-            logger.info(f"[BiliVerifyFeishu] 非白名单群入群申请，忽略: group={group_openid}, user={member_openid}")
+            logger.info(
+                f"[BiliVerifyFeishu] 非白名单群入群申请，忽略:"
+                f" group={group_openid}, user={member_openid}"
+            )
             return
 
         uid = self._extract_uid(comment)
         if uid is None:
             logger.info(
-                f"[BiliVerifyFeishu] 捕获白名单群入群请求但无有效UID，拒绝: group={group_openid}, user={member_openid}({username}), comment={comment!r}"
+                f"[BiliVerifyFeishu] 捕获白名单群入群请求但无有效UID，拒绝:"
+                f" group={group_openid}, user={member_openid}({username}),"
+                f" comment={comment!r}"
             )
             await self._qqofficial_approve_join_request(
                 group_openid=group_openid,
@@ -1485,8 +1567,10 @@ class BiliVerifyFeishuPlugin(Star):
 
         uid_num = int(uid)
         qq_key: int | str = member_openid
-        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        nickname = username or await self._resolve_nickname(user_id=member_openid, event=None, raw=raw_item)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000)
+        nickname = username or await self._resolve_nickname(
+            user_id=member_openid, event=None, raw=raw_item
+        )
 
         fields = self._build_fields_for_join(
             uid_num=uid_num,
@@ -1502,7 +1586,10 @@ class BiliVerifyFeishuPlugin(Star):
             qq_field_name="QQ号",
         )
         if success:
-            logger.info(f"[BiliVerifyFeishu] QQ官方入群 UID 写入成功，准备放行: UID={uid}, openid={member_openid}, 群={group_openid}")
+            logger.info(
+                f"[BiliVerifyFeishu] QQ官方入群 UID 写入成功，准备放行:"
+                f" UID={uid}, openid={member_openid}, 群={group_openid}"
+            )
             self._verified_before_join.add(f"{group_openid}:{member_openid}")
             self._pending_uid.discard(f"{group_openid}:{member_openid}")
             await self._qqofficial_approve_join_request(
@@ -1512,10 +1599,13 @@ class BiliVerifyFeishuPlugin(Star):
                 approve=True,
             )
         else:
-            logger.error(f"[BiliVerifyFeishu] QQ官方入群 UID 写入失败，已加入待处理: UID={uid}, openid={member_openid}")
+            logger.error(
+                f"[BiliVerifyFeishu] QQ官方入群 UID 写入失败，已加入待处理:"
+                f" UID={uid}, openid={member_openid}"
+            )
             add_to_pending(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group_openid,
                     "user_id": member_openid,
                     "uid": uid,
@@ -1524,7 +1614,10 @@ class BiliVerifyFeishuPlugin(Star):
                     "join_request_id": join_request_id,
                 }
             )
-            logger.warning(f"[BiliVerifyFeishu] 飞书写入失败但仍放行（qq_official）: UID={uid}, openid={member_openid}")
+            logger.warning(
+                f"[BiliVerifyFeishu] 飞书写入失败但仍放行（qq_official）:"
+                f" UID={uid}, openid={member_openid}"
+            )
             await self._qqofficial_approve_join_request(
                 group_openid=group_openid,
                 member_openid=member_openid,
@@ -1545,7 +1638,8 @@ class BiliVerifyFeishuPlugin(Star):
         adapter = self._qqofficial_adapter_by_id(pid)
         if adapter is None:
             logger.error(
-                f"[BiliVerifyFeishu] 审批失败: 群 {group_openid} 归属实例不存在: {pid or '(未记录)'}"
+                f"[BiliVerifyFeishu] 审批失败:"
+                f" 群 {group_openid} 归属实例不存在: {pid or '(未记录)'}"
             )
             return False
         try:
@@ -1586,23 +1680,17 @@ class BiliVerifyFeishuPlugin(Star):
         """插件销毁。"""
         if self._pending_check_task is not None:
             self._pending_check_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._pending_check_task
-            except asyncio.CancelledError:
-                pass
             self._pending_check_task = None
         if self._qqofficial_poll_task is not None:
             self._qqofficial_poll_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._qqofficial_poll_task
-            except asyncio.CancelledError:
-                pass
             self._qqofficial_poll_task = None
         if self._offline_monitor_task is not None:
             self._offline_monitor_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._offline_monitor_task
-            except asyncio.CancelledError:
-                pass
             self._offline_monitor_task = None
         logger.info("[BiliVerifyFeishu] 插件已卸载")

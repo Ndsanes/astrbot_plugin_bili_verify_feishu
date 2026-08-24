@@ -4,7 +4,7 @@ member_registry — 深 module / 窄 interface / 高 leverage
 职责（depth）：
   收口飞书多维表格的成员落库细节，提供领域导向的窄 interface。
   隐藏内部：字段映射（UID/QQ号/昵称/时间/状态）、int|str openid 兼容、
-  重试/指数退避、限流（5 QPS）、lark SDK 调用、app_token/table_id 归一。
+  重试/指数退避、lark_cli 网关调用、app_token/table_id 归一。
 
 对外暴露（seam 之后）：
   MemberRegistry.register(uid, openid, nickname) -> bool
@@ -19,9 +19,9 @@ member_registry — 深 module / 窄 interface / 高 leverage
 """
 from __future__ import annotations
 
-import time
-from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 
 try:
     from astrbot.api import logger
@@ -30,8 +30,10 @@ except Exception:  # pragma: no cover
     logger = _l.getLogger(__name__)
 
 from .feishu_client import (
-    upsert_member_row_by_qq_with_retry as _upsert_with_retry,
     update_member_status_by_qq_with_retry as _update_status_with_retry,
+)
+from .feishu_client import (
+    upsert_member_row_by_qq_with_retry as _upsert_with_retry,
 )
 
 
@@ -67,7 +69,7 @@ class MemberRegistry:
         self._status_left = (status_left or "已退群").strip() or "已退群"
 
     @classmethod
-    def from_plugin_config(cls, cfg: Any) -> "MemberRegistry":
+    def from_plugin_config(cls, cfg: Any) -> MemberRegistry:
         """从 Typed Config 构造（兼容 PluginConfig 或 dict）。"""
         try:
             # 尝试按 PluginConfig dataclass 读取
@@ -94,7 +96,7 @@ class MemberRegistry:
         return cls(config={})
 
     def _build_fields(self, uid: int, openid: int | str, nickname: str) -> dict[str, Any]:
-        time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        time_ms = int(datetime.now(UTC).timestamp() * 1000)
         return {
             "UID": int(uid),
             "QQ号": _qq_value(openid),
@@ -135,7 +137,7 @@ class MemberRegistry:
             logger.warning(f"[MemberRegistry] mark_left failed openid={openid}")
         return ok
 
-    async def find(self, openid: int | str) -> Optional[str]:
+    async def find(self, openid: int | str) -> str | None:
         """按 openid 查找记录（仅作 seam 预留，当前实现透传 feishu_client）。"""
         # 为保持窄 interface，暂不暴露底层 search；需要时可扩展
         from .feishu_client import _find_record_id_by_qq  # type: ignore

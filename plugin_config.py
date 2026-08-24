@@ -25,8 +25,9 @@ plugin_config — 深 module / 窄 interface / 高 leverage
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 
 def _safe_int(v: Any, default: int, minimum: int = 1) -> int:
@@ -76,8 +77,10 @@ def _as_list(v: Any) -> list[str]:
 
 @dataclass(frozen=True, slots=True)
 class FeishuCfg:
+    # app_id/app_secret 已弃用：认证由 lark_cli 平台网关统一负责，键保留仅为兼容旧配置
     app_id: str = ""
     app_secret: str = ""
+    # 业务数据归属配置：多维表格坐标仍由本插件自持
     app_token: str = ""
     table_id: str = ""
     status_field: str = "状态"
@@ -148,7 +151,7 @@ class PluginConfig:
     _raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
-    def from_dict(cls, raw: Mapping[str, Any] | None) -> "PluginConfig":
+    def from_dict(cls, raw: Mapping[str, Any] | None) -> PluginConfig:
         raw = dict(raw or {})
         feishu = FeishuCfg(
             app_id=str(raw.get("FEISHU_APP_ID", "") or "").strip(),
@@ -194,7 +197,10 @@ class PluginConfig:
         offline = OfflineCfg(
             enabled=_safe_bool(raw.get("ENABLE_OFFLINE_NOTIFY", False), False),
             targets=_as_list(raw.get("OFFLINE_FEISHU_TARGETS", [])),
-            id_type=(str(raw.get("OFFLINE_FEISHU_ID_TYPE", "open_id") or "open_id").strip() or "open_id"),
+            id_type=(
+                str(raw.get("OFFLINE_FEISHU_ID_TYPE", "open_id") or "open_id").strip()
+                or "open_id"
+            ),
             check_interval=_safe_int(raw.get("OFFLINE_CHECK_INTERVAL", 60), 60, 10),
             threshold=_safe_int(raw.get("OFFLINE_THRESHOLD", 3), 3, 1),
             recovery_notify=_safe_bool(raw.get("OFFLINE_RECOVERY_NOTIFY", True), True),
@@ -216,11 +222,21 @@ class PluginConfig:
             startup_limit=poll.startup_scan_limit,
         )
         retry = RetryCfg(max_retries=feishu.max_retries, delay=feishu.retry_delay)
-        return cls(feishu=feishu, poll=poll, delays=delays, whitelist=whitelist, offline=offline, pending=pending, retry=retry, _raw=raw)
+        return cls(
+            feishu=feishu,
+            poll=poll,
+            delays=delays,
+            whitelist=whitelist,
+            offline=offline,
+            pending=pending,
+            retry=retry,
+            _raw=raw,
+        )
 
     def validate(self) -> list[str]:
+        # 认证（FEISHU_APP_ID/SECRET）已由 lark_cli 平台网关统一负责，不再必填
         errs: list[str] = []
-        for k in ("app_id", "app_secret", "app_token", "table_id"):
+        for k in ("app_token", "table_id"):
             if not getattr(self.feishu, k):
                 errs.append(f"缺少必要配置: FEISHU_{k.upper()}")
         return errs
@@ -287,4 +303,16 @@ class PluginConfig:
         }
 
 
-__all__ = ["PluginConfig", "FeishuCfg", "PollCfg", "DelayCfg", "WhitelistCfg", "OfflineCfg", "PendingCfg", "RetryCfg", "_safe_int", "_safe_bool", "_safe_float"]
+__all__ = [
+    "PluginConfig",
+    "FeishuCfg",
+    "PollCfg",
+    "DelayCfg",
+    "WhitelistCfg",
+    "OfflineCfg",
+    "PendingCfg",
+    "RetryCfg",
+    "_safe_int",
+    "_safe_bool",
+    "_safe_float",
+]

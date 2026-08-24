@@ -1,41 +1,61 @@
+"""feishu_client — 通过 lark_cli 平台网关调用飞书开放接口的薄客户端。
+
+认证、登录态、TAT 刷新与限速全部由 lark_cli 平台适配器（网关）单点负责；
+本模块只保留业务语义：多维表格记录读写与消息发送，以及重试/指数退避韧性。
+main.py 在 initialize 时通过 set_gateway() 注入网关实例；未注入或网关调用
+抛错时按既有失败语义返回 False / 空串，不抛出、不崩溃。
+"""
+
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import parse_qs, urlparse
-
-import lark_oapi as lark
-from lark_oapi.api.bitable.v1 import (
-    CreateAppTableRecordRequest,
-    CreateAppTableRecordResponse,
-    SearchAppTableRecordRequest,
-    SearchAppTableRecordRequestBody,
-    SearchAppTableRecordResponse,
-    UpdateAppTableRecordRequest,
-    UpdateAppTableRecordResponse,
-)
-
-try:
-    # 旧版 SDK
-    from lark_oapi.api.bitable.v1 import CreateAppTableRecordRequestBody as RecordBody
-except ImportError:
-    # 新版 SDK 使用 AppTableRecord 作为请求体
-    from lark_oapi.api.bitable.v1 import AppTableRecord as RecordBody
 
 try:
     from astrbot.api import logger
 except Exception:
     logger = logging.getLogger(__name__)
 
-# 全局客户端实例（延迟初始化）
-_client: lark.Client | None = None
-_client_key: tuple[str, str] | None = None
+# 模块级网关实例（由 main.initialize 注入；None 表示未接入网关）
+_gateway: Any | None = None
 
-# 飞书 API 限速：统一限制为每秒最多 5 次请求
-MAX_REQUESTS_PER_SECOND = 5
-_MIN_REQUEST_INTERVAL = 1.0 / MAX_REQUESTS_PER_SECOND
-_rate_limit_lock = asyncio.Lock()
-_next_request_ts = 0.0
+
+def set_gateway(gateway: Any) -> None:
+    """注入 lark_cli 平台适配器（网关）实例；传 None 表示解除注入。"""
+    global _gateway
+    _gateway = gateway
+
+
+def _get_gateway() -> Any | None:
+    """返回已注入的网关实例；未注入时返回 None（调用方走降级路径）。"""
+    return _gateway
+
+
+async def _gateway_api(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """经网关透传一次飞书开放 API 调用，失败时记 ERROR 并返回 None。"""
+    gateway = _get_gateway()
+    if gateway is None:
+        logger.error(f"lark_cli 网关未注入，放弃飞书调用: {method} {path}")
+        return None
+    try:
+        result: Any = await gateway.api(method, path, params=params, data=data)
+    except Exception as e:
+        logger.error(f"lark_cli 网关调用异常 ({method} {path}): {e}")
+        return None
+    if not isinstance(result, Mapping):
+        logger.error(f"lark_cli 网关返回非 dict 响应 ({method} {path})")
+        return None
+    return dict(result)
 
 
 def _safe_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -99,36 +119,19 @@ def _normalize_bitable_ids(
     return app_token, table_id
 
 
-async def _acquire_rate_limit_slot() -> None:
-    """在单进程内按固定间隔发起请求，避免触发飞书限速。"""
-    global _next_request_ts
-
-    async with _rate_limit_lock:
-        now = time.monotonic()
-        if now < _next_request_ts:
-            await asyncio.sleep(_next_request_ts - now)
-            now = time.monotonic()
-        _next_request_ts = now + _MIN_REQUEST_INTERVAL
+def _records_base_path(app_token: str, table_id: str) -> str:
+    """拼出多维表格 records 集合的 API 基础路径。"""
+    return f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
 
 
-def _get_client(config: Mapping[str, Any]) -> lark.Client:
-    """获取或创建飞书 API 客户端实例。"""
-    global _client, _client_key
-
-    app_id = str(config.get("FEISHU_APP_ID", "")).strip()
-    app_secret = str(config.get("FEISHU_APP_SECRET", "")).strip()
-    key = (app_id, app_secret)
-    if _client is None or _client_key != key:
-        _client = (
-            lark.Client.builder()
-            .app_id(app_id)
-            .app_secret(app_secret)
-            .log_level(lark.LogLevel.WARNING)
-            .build()
-        )
-        _client_key = key
-        logger.info("飞书 API 客户端已初始化")
-    return _client
+def _normalize_qq_value(qq_num: int | str) -> int | str:
+    """兼容 openid 字符串：数字 QQ 转 int，其余原样透传。"""
+    if isinstance(qq_num, str) and qq_num.isdigit():
+        try:
+            return int(qq_num)
+        except ValueError:
+            return qq_num
+    return qq_num
 
 
 async def append_row_to_table(
@@ -141,6 +144,7 @@ async def append_row_to_table(
 
     Args:
         fields: 要写入的字段数据，格式如 {"UID": "12345", "QQ号": "67890"}
+        config: 插件配置映射
         app_token: 多维表格 app_token，默认从配置读取
         table_id: 数据表 table_id，默认从配置读取
 
@@ -161,40 +165,22 @@ async def append_row_to_table(
     if str(raw_app_token or "").strip() != app_token:
         logger.warning("检测到 FEISHU_APP_TOKEN 格式异常，已自动清洗后再写入")
 
-    client = _get_client(config)
-
     if not app_token or not table_id:
         logger.error("飞书写入失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
         return False
 
-    # 构建请求对象
-    request: CreateAppTableRecordRequest = (
-        CreateAppTableRecordRequest.builder()
-        .app_token(app_token)
-        .table_id(table_id)
-        .request_body(RecordBody.builder().fields(fields).build())
-        .build()
+    result = await _gateway_api(
+        "POST",
+        _records_base_path(app_token, table_id),
+        data={"fields": fields},
     )
-
-    # 发起异步请求
-    try:
-        await _acquire_rate_limit_slot()
-        response: CreateAppTableRecordResponse = (
-            await client.bitable.v1.app_table_record.acreate(request)
-        )
-    except Exception as e:
-        logger.error(f"飞书写入异常: {e}")
+    if result is None:
         return False
 
-    # 处理响应
-    if not response.success():
-        logger.error(
-            f"飞书写入失败, code: {response.code}, msg: {response.msg}, "
-            f"log_id: {response.get_log_id()}"
-        )
-        return False
-
-    record_id = getattr(getattr(response.data, "record", None), "record_id", "")
+    record_id = ""
+    record = result.get("record")
+    if isinstance(record, Mapping):
+        record_id = str(record.get("record_id", "") or "")
     logger.info(f"飞书写入成功, record_id: {record_id}")
     return True
 
@@ -209,6 +195,7 @@ async def append_row_with_retry(
 
     Args:
         fields: 要写入的字段数据
+        config: 插件配置映射
         max_retries: 最大重试次数，默认从配置读取
         retry_delay: 基础重试延迟（秒），默认从配置读取
 
@@ -233,30 +220,24 @@ async def append_row_with_retry(
 
         if attempt < _max_retries - 1:
             delay = _retry_delay * (2**attempt)
-            logger.warning(
-                f"飞书写入失败，{delay:.1f}秒后进行第 {attempt + 2} 次重试..."
-            )
+            logger.warning(f"飞书写入失败，{delay:.1f}秒后进行第 {attempt + 2} 次重试...")
             await asyncio.sleep(delay)
 
     logger.error(f"飞书写入失败，已重试 {_max_retries} 次")
     return False
 
 
-def _first_record_id_from_search_response(response: SearchAppTableRecordResponse) -> str:
-    """从搜索响应中提取首条记录 ID。"""
-    data = getattr(response, "data", None)
-    items = getattr(data, "items", None)
+def _first_record_id_from_search_response(result: Mapping[str, Any] | None) -> str:
+    """从搜索响应 data 中提取首条记录 ID。"""
+    if not isinstance(result, Mapping):
+        return ""
+    items = result.get("items")
     if not isinstance(items, list) or not items:
         return ""
 
     first_item = items[0]
-    record_id = getattr(first_item, "record_id", "")
-    if record_id:
-        return str(record_id).strip()
-
-    if isinstance(first_item, dict):
-        return str(first_item.get("record_id", "")).strip()
-
+    if isinstance(first_item, Mapping):
+        return str(first_item.get("record_id", "") or "").strip()
     return ""
 
 
@@ -265,7 +246,7 @@ async def _find_record_id_by_qq(
     config: Mapping[str, Any],
     qq_field_name: str = "QQ号",
 ) -> tuple[bool, str]:
-    """按 QQ 查询首条记录，返回(查询成功, record_id)。兼容数字 QQ 与 qq_official 的 openid 字符串。"""
+    """按 QQ 查询首条记录，返回(查询成功, record_id)。兼容数字 QQ 与 openid 字符串。"""
     app_token, table_id = _normalize_bitable_ids(
         config.get("FEISHU_APP_TOKEN", ""),
         config.get("FEISHU_TABLE_ID", ""),
@@ -275,57 +256,27 @@ async def _find_record_id_by_qq(
         return False, ""
 
     qq_field = str(qq_field_name).strip() or "QQ号"
-    client = _get_client(config)
-    # 兼容 openid 字符串：飞书侧字段若为文本类型需传字符串，若为数字类型则传 int
-    qq_value: int | str = qq_num
-    if isinstance(qq_num, str) and qq_num.isdigit():
-        try:
-            qq_value = int(qq_num)
-        except ValueError:
-            qq_value = qq_num
     filter_payload = {
         "conjunction": "and",
         "conditions": [
             {
                 "field_name": qq_field,
                 "operator": "is",
-                "value": [qq_value],
+                "value": [_normalize_qq_value(qq_num)],
             }
         ],
     }
 
-    search_request: SearchAppTableRecordRequest = (
-        SearchAppTableRecordRequest.builder()
-        .app_token(app_token)
-        .table_id(table_id)
-        .page_size(1)
-        .request_body(
-            SearchAppTableRecordRequestBody.builder()
-            .filter(filter_payload)
-            .build()
-        )
-        .build()
+    result = await _gateway_api(
+        "POST",
+        f"{_records_base_path(app_token, table_id)}/search",
+        params={"page_size": 1},
+        data={"field_names": [qq_field], "filter": filter_payload},
     )
-
-    try:
-        await _acquire_rate_limit_slot()
-        search_response: SearchAppTableRecordResponse = (
-            await client.bitable.v1.app_table_record.asearch(search_request)
-        )
-    except Exception as e:
-        logger.error(f"飞书查询记录异常: {e}")
+    if result is None:
         return False, ""
 
-    if not search_response.success():
-        logger.error(
-            "飞书查询记录失败, "
-            f"code: {search_response.code}, msg: {search_response.msg}, "
-            f"log_id: {search_response.get_log_id()}"
-        )
-        return False, ""
-
-    record_id = _first_record_id_from_search_response(search_response)
-    return True, record_id
+    return True, _first_record_id_from_search_response(result)
 
 
 async def upsert_member_row_by_qq(
@@ -354,31 +305,12 @@ async def upsert_member_row_by_qq(
         logger.error("飞书更新失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
         return False
 
-    client = _get_client(config)
-    update_request: UpdateAppTableRecordRequest = (
-        UpdateAppTableRecordRequest.builder()
-        .app_token(app_token)
-        .table_id(table_id)
-        .record_id(record_id)
-        .request_body(RecordBody.builder().fields(fields).build())
-        .build()
+    result = await _gateway_api(
+        "PUT",
+        f"{_records_base_path(app_token, table_id)}/{record_id}",
+        data={"fields": fields},
     )
-
-    try:
-        await _acquire_rate_limit_slot()
-        update_response: UpdateAppTableRecordResponse = (
-            await client.bitable.v1.app_table_record.aupdate(update_request)
-        )
-    except Exception as e:
-        logger.error(f"飞书更新记录异常: {e}")
-        return False
-
-    if not update_response.success():
-        logger.error(
-            "飞书更新记录失败, "
-            f"code: {update_response.code}, msg: {update_response.msg}, "
-            f"log_id: {update_response.get_log_id()}"
-        )
+    if result is None:
         return False
 
     logger.info(f"飞书记录已按QQ复用更新: QQ={qq_num}, record_id={record_id}")
@@ -457,35 +389,17 @@ async def update_member_status_by_qq(
         logger.error("飞书状态更新失败: FEISHU_APP_TOKEN 或 FEISHU_TABLE_ID 未配置")
         return False
 
-    client = _get_client(config)
-
-    update_request: UpdateAppTableRecordRequest = (
-        UpdateAppTableRecordRequest.builder()
-        .app_token(app_token)
-        .table_id(table_id)
-        .record_id(record_id)
-        .request_body(RecordBody.builder().fields({status_field: status_text}).build())
-        .build()
+    result = await _gateway_api(
+        "PUT",
+        f"{_records_base_path(app_token, table_id)}/{record_id}",
+        data={"fields": {status_field: status_text}},
     )
-
-    try:
-        await _acquire_rate_limit_slot()
-        update_response: UpdateAppTableRecordResponse = (
-            await client.bitable.v1.app_table_record.aupdate(update_request)
-        )
-    except Exception as e:
-        logger.error(f"飞书状态更新失败，更新记录异常: {e}")
+    if result is None:
         return False
 
-    if not update_response.success():
-        logger.error(
-            "飞书状态更新失败，更新记录失败, "
-            f"code: {update_response.code}, msg: {update_response.msg}, "
-            f"log_id: {update_response.get_log_id()}"
-        )
-        return False
-
-    logger.info(f"飞书状态更新成功: QQ={qq_num}, 状态={status_text}, record_id={record_id}")
+    logger.info(
+        f"飞书状态更新成功: QQ={qq_num}, 状态={status_text}, record_id={record_id}"
+    )
     return True
 
 
@@ -538,14 +452,11 @@ async def send_feishu_message(
     receive_id_type: str = "open_id",
     msg_type: str = "text",
 ) -> bool:
-    """通过飞书开放 API (im/v1/messages) 发送私聊/群聊消息。
+    """通过网关发送私聊/群聊消息（POST /open-apis/im/v1/messages）。
 
     文档: https://open.feishu.cn/document/server-docs/im-v1/message/create
-    SDK: lark_oapi.api.im.v1.CreateMessageRequest / CreateMessageResponse
-    权限需求: im:message:send_as_bot (或 im:message)，且机器人与目标有会话。
+    认证与限速由 lark_cli 平台网关负责；本函数只组装业务报文。
     """
-    import json as _json
-
     receive_id = str(receive_id or "").strip()
     receive_id_type = str(receive_id_type or "open_id").strip() or "open_id"
     if not receive_id:
@@ -554,59 +465,33 @@ async def send_feishu_message(
 
     # 允许的 receive_id_type: open_id, user_id, union_id, email, chat_id
     if receive_id_type not in {"open_id", "user_id", "union_id", "email", "chat_id"}:
-        logger.warning(f"[FeishuMessage] 未知的 receive_id_type={receive_id_type}，回退为 open_id")
+        logger.warning(
+            f"[FeishuMessage] 未知的 receive_id_type={receive_id_type}，回退为 open_id"
+        )
         receive_id_type = "open_id"
 
     # 内容包装：text 类型需为 JSON 字符串 {"text": "..."}
     if msg_type == "text":
-        text_content = _json.dumps({"text": str(content)}, ensure_ascii=False)
+        text_content = json.dumps({"text": str(content)}, ensure_ascii=False)
     else:
         text_content = str(content)
 
-    # 校验基础配置
-    app_id = str(config.get("FEISHU_APP_ID", "") or "").strip()
-    app_secret = str(config.get("FEISHU_APP_SECRET", "") or "").strip()
-    if not app_id or not app_secret:
-        logger.error("[FeishuMessage] 发送失败: FEISHU_APP_ID / FEISHU_APP_SECRET 未配置")
-        return False
-
-    client = _get_client(config)
-
-    try:
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-    except ImportError as e:
-        logger.error(f"[FeishuMessage] 导入飞书消息模型失败: {e}")
-        return False
-
-    request = (
-        CreateMessageRequest.builder()
-        .receive_id_type(receive_id_type)
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(receive_id)
-            .msg_type(msg_type)
-            .content(text_content)
-            .build()
-        )
-        .build()
+    result = await _gateway_api(
+        "POST",
+        "/open-apis/im/v1/messages",
+        params={"receive_id_type": receive_id_type},
+        data={
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": text_content,
+        },
     )
-
-    try:
-        await _acquire_rate_limit_slot()
-        # lark SDK 异步方法为 acreate
-        response = await client.im.v1.message.acreate(request)
-    except Exception as e:
-        logger.error(f"[FeishuMessage] 发送异常 receive_id={receive_id}: {e}")
+    if result is None:
         return False
 
-    if not response.success():
-        logger.error(
-            f"[FeishuMessage] 发送失败 receive_id={receive_id}, "
-            f"code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
-        )
-        return False
-
-    logger.info(f"[FeishuMessage] 发送成功 receive_id={receive_id}, type={receive_id_type}")
+    logger.info(
+        f"[FeishuMessage] 发送成功 receive_id={receive_id}, type={receive_id_type}"
+    )
     return True
 
 
@@ -616,7 +501,10 @@ async def broadcast_feishu_message(
 ) -> int:
     """向 OFFLINE_FEISHU_TARGETS 配置的所有目标广播同一条消息。返回成功数。"""
     raw_targets = config.get("OFFLINE_FEISHU_TARGETS", [])
-    id_type = str(config.get("OFFLINE_FEISHU_ID_TYPE", "open_id") or "open_id").strip() or "open_id"
+    id_type = (
+        str(config.get("OFFLINE_FEISHU_ID_TYPE", "open_id") or "open_id").strip()
+        or "open_id"
+    )
 
     targets: list[str] = []
     if isinstance(raw_targets, list):

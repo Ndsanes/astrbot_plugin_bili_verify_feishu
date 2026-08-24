@@ -2,6 +2,14 @@
 
 本文件供 AstrBot 面板「插件更新日志」读取（`CHANGELOG.md`）。每次发版前更新对应条目。
 
+## v0.1.0 (2026-08-24)
+
+### 变更
+
+- **飞书调用收口到 lark_cli 平台网关**：`feishu_client` 内部引擎从 lark-oapi SDK 整体替换为经 `lark_cli` 平台适配器透传（多维表格 records search/create/update、im/v1/messages）。认证、登录态、TAT 刷新与限速全部由网关单点负责；插件在 initialize 时自动注入网关，未注入或调用抛错时记 ERROR 并走既有失败语义（False/None），不崩溃。
+- 移除 lark-oapi 依赖（requirements.txt 清空）与本地 5 QPS 限速器；`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 不再必填（配置键保留但已弃用），`FEISHU_APP_TOKEN` / `FEISHU_TABLE_ID` 仍由本插件配置（业务数据归属）。
+- 重试/指数退避等业务韧性逻辑保留；测试改为注入假网关（记录 method/path/data 并回预设响应），删除 lark_oapi 桩包。
+
 ## v0.0.7 (2026-08-24)
 
 ### 修复

@@ -3,7 +3,8 @@ admission — 深 module / 窄 interface / 高 depth
 
 职责（depth）：
   收口分散在 main.py 的两条重复链路：
-  aiocqhttp 推送（_on_group_request）与 qq_official 轮询（_handle_qqofficial_join_request / _poll_* / _qqofficial_approve）
+  aiocqhttp 推送（_on_group_request）与 qq_official 轮询
+  （_handle_qqofficial_join_request / _poll_* / _qqofficial_approve）
   的共同序列：提取 UID → 组装 → 飞书落库 → 放行/拒绝。
 
 隐藏的内部（seam 之后）：
@@ -30,8 +31,8 @@ import asyncio
 import random
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import Literal
 
 try:
     from astrbot.api import logger
@@ -122,8 +123,12 @@ class AdmissionService:
 
         uid = _extract_uid(comment)
         if uid is None:
-            logger.info(f"[Admission] 无有效 UID，拒绝 group={group} user={user} comment={comment!r}")
-            return AdmissionResult(decision="decline", uid=None, reason="请在入群验证信息中提供B站UID")
+            logger.info(
+                f"[Admission] 无有效 UID，拒绝 group={group} user={user} comment={comment!r}"
+            )
+            return AdmissionResult(
+                decision="decline", uid=None, reason="请在入群验证信息中提供B站UID"
+            )
 
         # 飞书落库（经 MemberRegistry 深 module）
         ok = await self._registry.register(int(uid), user, req.username)
@@ -137,7 +142,7 @@ class AdmissionService:
             # 失败入 pending，仍放行由补偿处理（保持原策略）
             self._store.enqueue_failed(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group,
                     "user_id": user,
                     "uid": uid,
@@ -149,7 +154,9 @@ class AdmissionService:
             logger.warning(f"[Admission] 飞书写入失败已入 pending，仍放行 uid={uid} user={user}")
             return AdmissionResult(decision="approve", uid=uid, reason="feishu_pending")
 
-    async def admit_message(self, group_id: str, user_id: str, text: str, nickname: str = "") -> bool:
+    async def admit_message(
+        self, group_id: str, user_id: str, text: str, nickname: str = ""
+    ) -> bool:
         """
         处理群内补录消息（qq_official @消息 或 aiocqhttp pending 校验后）。
 
@@ -175,7 +182,7 @@ class AdmissionService:
         else:
             self._store.enqueue_failed(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "group_id": group,
                     "user_id": user,
                     "uid": uid,

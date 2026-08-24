@@ -6,8 +6,6 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 
 本插件使用 AstrBot 官方插件配置机制，所以你可以在 AstrBot WebUI 插件配置页面直接填写以下配置项：
 
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
 - `FEISHU_APP_TOKEN`
 - `FEISHU_TABLE_ID`
 - `FEISHU_STATUS_FIELD`
@@ -54,22 +52,16 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 
 ## 真实环境验证（.env）
 
-可通过本仓库提供的验证脚本做一次真实链路验证（飞书写入）。
+网关化改造后，认证、登录态、TAT 刷新与限速全部由 lark_cli 平台适配器（网关）统一负责，
+本插件不再自持 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（旧配置键保留但已弃用，填写也不会被使用）。
 
 1. 在项目根目录创建 `.env`，至少包含：
-	- `FEISHU_APP_ID`
-	- `FEISHU_APP_SECRET`
 	- `FEISHU_APP_TOKEN`
 	- `FEISHU_TABLE_ID`
-2. 可选配置：
-	- `MAX_RETRIES`（默认 `3`）
-	- `RETRY_DELAY`（默认 `1.0`）
-3. 先做配置体检（不写入飞书）：
+2. 运行配置体检（仅校验本地配置，不发起真实写入）：
 	- `python3 tools/real_env_validate.py`
-4. 执行真实写入验证（示例写入 3 条）：
-	- `python3 tools/real_env_validate.py --write --count 3`
 
-说明：插件内已统一做飞书 API 调用限速，单进程下最多 `5 req/s`，用于降低触发 Lark 限速的风险。
+说明：飞书 API 限速由网关单点 RateLimiter 统一控制；本插件内保留重试/指数退避等业务韧性逻辑。
 
 ## 参考文档
 
