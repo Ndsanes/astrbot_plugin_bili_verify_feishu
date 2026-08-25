@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.1.2",
+    "0.1.3",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -156,6 +156,10 @@ class BiliVerifyFeishuPlugin(Star):
 
     async def initialize(self):
         """插件初始化，加载配置并校验。"""
+        # 白名单播种：文件缺失/为空时从 WHITELIST_GROUPS 配置重建。
+        # repo 方式更新会以仓库内容覆盖插件目录，运行时 whitelist.json 随之丢失；
+        # 不在此处播种则轮询永远拿到空白名单、入群申请静默空转（v0.1.3 回归修复）。
+        self._init_whitelist_from_config()
         # 注入 lark_cli 平台网关：认证/登录态/TAT 刷新/限速全部由网关单点负责
         gateway = self._get_lark_gateway()
         set_gateway(gateway)

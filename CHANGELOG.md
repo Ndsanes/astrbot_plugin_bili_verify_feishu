@@ -2,6 +2,12 @@
 
 本文件供 AstrBot 面板「插件更新日志」读取（`CHANGELOG.md`）。每次发版前更新对应条目。
 
+## v0.1.3 (2026-08-25)
+
+### 修复
+- **【严重】白名单配置播种从未接线，repo 更新后轮询永久空转**：`_init_whitelist_from_config()` 自 v0.0.x 起定义后没有任何调用点。白名单持久化文件位于插件目录内（`data/whitelist.json`），repo 方式更新会以仓库内容覆盖整个插件目录、运行时文件随之清空；此后每次启动 `load_whitelist()` 恒为空列表，QQ 官方入群申请轮询在 `_poll_qqofficial_join_requests_once` 入口静默返回——日志只有「开始首次拉取」，之后无任何动作也无告警（2026-08-25 实例实测复现）。现于 `initialize()` 开头接通播种：文件缺失/为空时自动从 `WHITELIST_GROUPS` 配置（存于实例 cmd_config.json，不受插件目录覆盖影响）重建白名单，已有数据不覆盖。回归测试 `tests/test_whitelist_seeding.py` 含 initialize 接线守卫。
+  - 已知残留：`pending.json` 等其余运行时状态同样存于插件目录内，仍会在 repo 更新时丢失；后续可考虑迁移至 `data/plugin_data/` 持久化根。
+
 ## v0.1.2 (2026-08-24)
 
 ### 清理
