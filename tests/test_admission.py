@@ -59,12 +59,15 @@ def make_harness(
     registry: FakeRegistry | None = None,
     groups=("g1",),
     checker: BiliUidChecker | None = None,
+    extra_config: dict | None = None,
 ) -> Harness:
     store = AdmissionsStore(data_dir=tmp_path)
     store._save_whitelist_to_file(list(groups))
     reg = registry if registry is not None else FakeRegistry()
     # 延迟钳为 0：决策域测试不测随机 sleep（_delay_if_needed 另有专项用例）
-    config = PluginConfig.from_dict(_ZERO_DELAY)
+    raw_config = dict(_ZERO_DELAY)
+    raw_config.update(extra_config or {})
+    config = PluginConfig.from_dict(raw_config)
     return Harness(AdmissionService(reg, store, config, checker=checker), store, reg)
 
 
@@ -253,14 +256,53 @@ async def test_decline_UID不存在时不写飞书(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_approve_接口未知时放行(tmp_path):
-    """B站接口超时/风控时不能误伤真实用户：按未知放行。"""
+async def test_defer_接口未知时暂缓审批(tmp_path):
+    """B站风控/超时：默认先不审批，返回 defer 由调用方 10 分钟后复查。"""
     checker = BiliUidChecker(fetcher=lambda uid: {"code": -352})
     h = make_harness(tmp_path, checker=checker)
     result = await h.service.admit_request(make_req(comment="UID 123456789"))
 
+    assert result.decision == "defer"
+    assert result.reason == "uid_check_unknown"
+    assert h.registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_复查仍未知时放行(tmp_path):
+    """复查（retry_unknown=True）仍未知时不能无限拖延：按放行处理。"""
+    checker = BiliUidChecker(fetcher=lambda uid: {"code": -352})
+    h = make_harness(tmp_path, checker=checker)
+    result = await h.service.admit_request(
+        make_req(comment="UID 123456789"), retry_unknown=True
+    )
+
     assert result.decision == "approve"
     assert h.registry.calls == [(123456789, "u1", "")]
+
+
+@pytest.mark.asyncio
+async def test_approve_关闭复查后直接放行(tmp_path):
+    """BILI_UID_CHECK_RETRY_SECONDS=0 时保持旧的 fail-open 行为。"""
+    checker = BiliUidChecker(fetcher=lambda uid: {"code": -352})
+    h = make_harness(
+        tmp_path, checker=checker, extra_config={"BILI_UID_CHECK_RETRY_SECONDS": 0}
+    )
+    result = await h.service.admit_request(make_req(comment="UID 123456789"))
+
+    assert result.decision == "approve"
+    assert h.registry.calls == [(123456789, "u1", "")]
+
+
+@pytest.mark.asyncio
+async def test_复查时明确不存在仍然拒绝(tmp_path):
+    checker = BiliUidChecker(fetcher=lambda uid: {"code": -404})
+    h = make_harness(tmp_path, checker=checker)
+    result = await h.service.admit_request(
+        make_req(comment="UID 999999999999"), retry_unknown=True
+    )
+
+    assert result.decision == "decline"
+    assert h.registry.calls == []
 
 
 @pytest.mark.asyncio

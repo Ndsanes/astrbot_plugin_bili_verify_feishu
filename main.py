@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.1.4",
+    "0.1.5",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -77,6 +77,12 @@ class BiliVerifyFeishuPlugin(Star):
                 self._get_config("BILI_UID_CHECK_CACHE_TTL", 3600), default=3600, minimum=0
             ),
         )
+        # UID 校验「未知」时的复查间隔（秒）；0 = 不复查，保持直接放行
+        self._uid_retry_seconds = self._safe_int(
+            self._get_config("BILI_UID_CHECK_RETRY_SECONDS", 600), default=600, minimum=0
+        )
+        # 延迟复查任务需要强引用，避免被 GC
+        self._retry_tasks: set[asyncio.Task] = set()
         # 深 modules（initialize 时按 PluginConfig 实例化，提供 seam）
         self._typed_config: Any | None = None
         self._admissions_store: Any | None = None
@@ -738,8 +744,14 @@ class BiliVerifyFeishuPlugin(Star):
             logger.error(f"[BiliVerifyFeishu] 处理加群请求失败: {e}")
             return False
 
-    async def _on_group_request(self, event: AstrMessageEvent | None, raw: dict):
-        """处理加群请求事件（request_type=group）。"""
+    async def _on_group_request(
+        self, event: AstrMessageEvent | None, raw: dict, *, retry_unknown: bool = False
+    ):
+        """处理加群请求事件（request_type=group）。
+
+        retry_unknown=True 表示这是 UID 校验「未知」后 10 分钟的复查：跳过随机延迟
+        与去重，复查结果仍未知时按放行处理。
+        """
         # 防 gank：随机延迟后再处理，避免被批量请求打爆飞书限流
         delay_min = self._safe_float(
             self._get_config("REQUEST_DELAY_MIN_SECONDS", 10.0), default=10.0, minimum=0.0
@@ -749,7 +761,7 @@ class BiliVerifyFeishuPlugin(Star):
         )
         if delay_max < delay_min:
             delay_max = delay_min
-        if delay_min > 0 or delay_max > 0:
+        if not retry_unknown and (delay_min > 0 or delay_max > 0):
             delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
             if delay > 0:
                 logger.debug(
@@ -767,9 +779,10 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         req_key = f"{group_id}:{user_id}:{flag}:{sub_type}"
-        if req_key in self._processed_request_keys:
-            return
-        self._processed_request_keys.add(req_key)
+        if not retry_unknown:
+            if req_key in self._processed_request_keys:
+                return
+            self._processed_request_keys.add(req_key)
 
         if not is_group_whitelisted(group_id):
             logger.info(
@@ -798,8 +811,24 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         uid_num = int(uid)
-        # 先确认 UID 在 B 站真实存在，再写飞书/放行（未知一律放行）
+        # 先确认 UID 在 B 站真实存在，再写飞书/放行
         uid_check = await self._uid_checker.check(uid_num)
+        if (
+            uid_check.status == "unknown"
+            and not retry_unknown
+            and self._uid_retry_seconds > 0
+        ):
+            logger.info(
+                "[BiliVerifyFeishu] 加群请求 UID 校验未知，暂缓审批: "
+                f"UID={uid}, QQ={user_id}, 群={group_id}, "
+                f"{self._uid_retry_seconds}s 后复查"
+            )
+            task = asyncio.create_task(
+                self._retry_group_request(event, raw)
+            )
+            self._retry_tasks.add(task)
+            task.add_done_callback(self._retry_tasks.discard)
+            return
         if uid_check.not_found:
             logger.info(
                 "[BiliVerifyFeishu] 加群请求的B站UID不存在，拒绝: "
@@ -876,6 +905,14 @@ class BiliVerifyFeishuPlugin(Star):
                 sub_type=sub_type,
                 approve=True,
             )
+
+    async def _retry_group_request(self, event: AstrMessageEvent | None, raw: dict) -> None:
+        """OneBot 加群请求的 UID 复查任务（真实事件对象在 10 分钟后仍可用于审批）。"""
+        await asyncio.sleep(self._uid_retry_seconds)
+        try:
+            await self._on_group_request(event, raw, retry_unknown=True)
+        except Exception as e:
+            logger.warning(f"[BiliVerifyFeishu] OneBot UID 复查失败: {e}")
 
     async def _on_member_increase(self, event: AstrMessageEvent, raw: dict):
         """处理新成员入群事件。"""
@@ -1546,6 +1583,113 @@ class BiliVerifyFeishuPlugin(Star):
                 return
             cursor = next_cursor
 
+    def _schedule_shallow_retry(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str,
+        username: str,
+        comment: str,
+        raw_item: dict,
+    ) -> None:
+        """浅路径（AdmissionService 不可用）的 UID 复查任务。"""
+        if self._uid_retry_seconds <= 0:
+            return
+        task = asyncio.create_task(
+            self._retry_shallow_join(
+                group_openid,
+                member_openid,
+                join_request_id,
+                username,
+                comment,
+                raw_item,
+            )
+        )
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    async def _retry_shallow_join(
+        self,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str,
+        username: str,
+        comment: str,
+        raw_item: dict,
+    ) -> None:
+        await asyncio.sleep(self._uid_retry_seconds)
+        try:
+            await self._handle_qqofficial_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                username=username,
+                comment=comment,
+                raw_item=raw_item,
+                retry_unknown=True,
+            )
+        except Exception as e:
+            logger.warning(f"[BiliVerifyFeishu] 浅路径 UID 复查失败: {e}")
+
+    async def _apply_admission_result(
+        self,
+        result,
+        group_openid: str,
+        member_openid: str,
+        join_request_id: str,
+    ) -> None:
+        """把 AdmissionService 的决策映射回平台审批动作。"""
+        if result.decision == "approve":
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=True,
+            )
+        elif result.decision in ("skip", "defer"):
+            # 重复申请 / 待复查：不做任何平台动作
+            return
+        elif result.reason == "not_whitelisted":
+            return
+        else:
+            # decline 场景（无 UID / UID 不存在等）
+            reason = result.reason or "请在入群验证信息中提供B站UID"
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=False,
+                reject_reason=reason,
+            )
+
+    def _schedule_join_retry(self, req) -> bool:
+        """UID 校验未知时，隔 retry 秒复查一次再审批（不阻塞轮询循环）。"""
+        if self._uid_retry_seconds <= 0 or self._admission_service is None:
+            return False
+        task = asyncio.create_task(self._retry_join_admission(req))
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+        return True
+
+    async def _retry_join_admission(self, req) -> None:
+        await asyncio.sleep(self._uid_retry_seconds)
+        try:
+            result = await self._admission_service.admit_request(
+                req, retry_unknown=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"[BiliVerifyFeishu] UID 复查失败，按放行处理: openid={req.member_openid} {e}"
+            )
+            return
+        logger.info(
+            "[BiliVerifyFeishu] UID 复查完成: "
+            f"user={req.member_openid} uid={result.uid} decision={result.decision}"
+        )
+        await self._apply_admission_result(
+            result, req.group_openid, req.member_openid, req.join_request_id
+        )
+
     async def _handle_qqofficial_join_request(
         self,
         group_openid: str,
@@ -1554,11 +1698,17 @@ class BiliVerifyFeishuPlugin(Star):
         username: str,
         comment: str,
         raw_item: dict,
+        *,
+        retry_unknown: bool = False,
     ):
         """处理单条 qq_official 入群申请：校验 UID -> 飞书 -> 放行/拒绝。
         优先走深 AdmissionService seam。"""
         # 深路径：通过 AdmissionService 统一决策与落库（窄 interface）
-        if self._admission_service is not None and JoinRequest is not None:
+        if (
+            not retry_unknown
+            and self._admission_service is not None
+            and JoinRequest is not None
+        ):
             try:
                 req = JoinRequest(
                     group_openid=group_openid,
@@ -1569,29 +1719,31 @@ class BiliVerifyFeishuPlugin(Star):
                     raw=raw_item or {},
                 )
                 result = await self._admission_service.admit_request(req)
+                if result.decision == "defer":
+                    # 风控/超时：请求保持未处理，隔 retry 秒复查一次再决定
+                    if self._schedule_join_retry(req):
+                        logger.info(
+                            "[BiliVerifyFeishu] UID 校验未知，暂缓审批: "
+                            f"user={member_openid} uid={result.uid} "
+                            f"{self._uid_retry_seconds}s 后复查"
+                        )
+                    else:
+                        # 没配置复查间隔的兜底：按放行处理，避免请求悬空
+                        logger.warning(
+                            "[BiliVerifyFeishu] UID 校验未知且未配置复查，直接放行: "
+                            f"user={member_openid} uid={result.uid}"
+                        )
+                        await self._qqofficial_approve_join_request(
+                            group_openid=group_openid,
+                            member_openid=member_openid,
+                            join_request_id=join_request_id,
+                            approve=True,
+                        )
+                    return
                 # 将 deep module 的决策映射回平台审批（seam 仍在 main 侧，保持两 adapter 可替换）
-                if result.decision == "approve":
-                    await self._qqofficial_approve_join_request(
-                        group_openid=group_openid,
-                        member_openid=member_openid,
-                        join_request_id=join_request_id,
-                        approve=True,
-                    )
-                elif result.decision == "skip":
-                    # 重复申请已处理过,不做任何平台动作
-                    return
-                elif result.reason == "not_whitelisted":
-                    return
-                else:
-                    # decline 场景（无 UID 等）
-                    reason = result.reason or "请在入群验证信息中提供B站UID"
-                    await self._qqofficial_approve_join_request(
-                        group_openid=group_openid,
-                        member_openid=member_openid,
-                        join_request_id=join_request_id,
-                        approve=False,
-                        reject_reason=reason,
-                    )
+                await self._apply_admission_result(
+                    result, group_openid, member_openid, join_request_id
+                )
                 return
             except Exception as e:
                 logger.warning(f"[BiliVerifyFeishu] 深 Admission 路径失败，回落浅路径: {e}")
@@ -1621,6 +1773,19 @@ class BiliVerifyFeishuPlugin(Star):
 
         uid_num = int(uid)
         uid_check = await self._uid_checker.check(uid_num)
+        if (
+            uid_check.status == "unknown"
+            and not retry_unknown
+            and self._uid_retry_seconds > 0
+        ):
+            logger.info(
+                "[BiliVerifyFeishu] UID 校验未知（浅路径），"
+                f"{self._uid_retry_seconds}s 后复查: user={member_openid} uid={uid}"
+            )
+            self._schedule_shallow_retry(
+                group_openid, member_openid, join_request_id, username, comment, raw_item
+            )
+            return
         if uid_check.not_found:
             logger.info(
                 "[BiliVerifyFeishu] 入群申请的B站UID不存在（浅路径），拒绝: "
@@ -1761,4 +1926,8 @@ class BiliVerifyFeishuPlugin(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._offline_monitor_task
             self._offline_monitor_task = None
+        # 延迟复查任务：插件卸载后不再审批，避免旧实例残留动作
+        for task in list(self._retry_tasks):
+            task.cancel()
+        self._retry_tasks.clear()
         logger.info("[BiliVerifyFeishu] 插件已卸载")

@@ -21,13 +21,15 @@ QQ 群入群校验辅助插件：在白名单群内，记录新成员提供的 B
 - `BILI_UID_CHECK`（默认开启）
 - `BILI_UID_CHECK_TIMEOUT`（默认 5 秒）
 - `BILI_UID_CHECK_CACHE_TTL`（默认 3600 秒）
+- `BILI_UID_CHECK_RETRY_SECONDS`（默认 600 秒）
 
 ## B站 UID 真实性校验
 
 - 开启 `BILI_UID_CHECK`（默认开启）后，入群备注/群消息里提取到的 UID 会先查询
   B站公开接口，确认账号真实存在，再决定放行与是否写飞书。
 - **只有 B站明确返回「用户不存在」才会拒绝**；接口超时、风控（-352）、网络错误
-  等一律按「未知」放行，避免把真实用户挡在门外。
+  等按「未知」处理：先暂缓审批，隔 `BILI_UID_CHECK_RETRY_SECONDS`（默认 10 分钟）
+  自动复查一次，仍未知才放行，避免把真实用户永远挡在门外。
 - 同一 UID 在 `BILI_UID_CHECK_CACHE_TTL`（默认 1 小时）内不会重复请求；
   「不存在」的结果最多缓存 10 分钟。设为 0 可关闭缓存。
 - 单次查询超时由 `BILI_UID_CHECK_TIMEOUT` 控制（默认 5 秒，最小 0.5 秒）。

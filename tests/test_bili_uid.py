@@ -151,16 +151,19 @@ def test_配置解析_UID校验三项带默认与钳制():
     assert cfg.bili.check_enabled is True
     assert cfg.bili.timeout == 5.0
     assert cfg.bili.cache_ttl == 3600
+    assert cfg.bili.retry_seconds == 600
 
     cfg = PluginConfig.from_dict(
         {
             "BILI_UID_CHECK": "false",
             "BILI_UID_CHECK_TIMEOUT": 0.1,
             "BILI_UID_CHECK_CACHE_TTL": -5,
+            "BILI_UID_CHECK_RETRY_SECONDS": 0,
         }
     )
     assert cfg.bili.check_enabled is False
     assert cfg.bili.timeout == 0.5  # 下限钳制
     assert cfg.bili.cache_ttl == 0  # 最小 0
+    assert cfg.bili.retry_seconds == 0
     assert cfg.get("BILI_UID_CHECK") is False
     assert cfg.as_dict()["BILI_UID_CHECK_TIMEOUT"] == 0.5

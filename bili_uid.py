@@ -16,7 +16,9 @@ bili_uid — B 站 UID 存在性校验（窄 interface / 深实现）
     - exists    : B 站接口明确返回该用户（code=0 且卡片带 mid）
     - not_found : B 站接口明确返回 -404（用户不存在 / 已注销 / 不可见）
     - unknown   : 超时、网络错误、风控（-352）、返回结构异常等
-                  **调用方应默认放行**——外部服务抖动不能把真实用户挡在门外。
+                  调用方先暂缓审批，隔 `BILI_UID_CHECK_RETRY_SECONDS`（默认 600 秒）
+                  复查一次；仍未知才放行——既不立刻放行假 UID，也不把真实用户
+                  永远挡在门外。
 
 数据源：
     GET https://api.bilibili.com/x/web-interface/card?mid=<uid>

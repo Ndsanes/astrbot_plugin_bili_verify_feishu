@@ -131,6 +131,8 @@ class BiliCfg:
     check_enabled: bool = True
     timeout: float = 5.0
     cache_ttl: int = 3600
+    # 校验结果为 unknown（风控/超时）时，等待多久再复查一次；0 = 不复查，直接放行
+    retry_seconds: int = 600
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +239,7 @@ class PluginConfig:
             check_enabled=_safe_bool(raw.get("BILI_UID_CHECK", True), True),
             timeout=_safe_float(raw.get("BILI_UID_CHECK_TIMEOUT", 5.0), 5.0, 0.5),
             cache_ttl=_safe_int(raw.get("BILI_UID_CHECK_CACHE_TTL", 3600), 3600, 0),
+            retry_seconds=_safe_int(raw.get("BILI_UID_CHECK_RETRY_SECONDS", 600), 600, 0),
         )
         return cls(
             feishu=feishu,
@@ -287,6 +290,7 @@ class PluginConfig:
             "BILI_UID_CHECK": self.bili.check_enabled,
             "BILI_UID_CHECK_TIMEOUT": self.bili.timeout,
             "BILI_UID_CHECK_CACHE_TTL": self.bili.cache_ttl,
+            "BILI_UID_CHECK_RETRY_SECONDS": self.bili.retry_seconds,
         }
         return mapping.get(key, default)
 
@@ -318,6 +322,7 @@ class PluginConfig:
             "BILI_UID_CHECK": self.bili.check_enabled,
             "BILI_UID_CHECK_TIMEOUT": self.bili.timeout,
             "BILI_UID_CHECK_CACHE_TTL": self.bili.cache_ttl,
+            "BILI_UID_CHECK_RETRY_SECONDS": self.bili.retry_seconds,
         }
 
 

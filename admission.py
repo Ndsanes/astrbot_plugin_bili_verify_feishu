@@ -45,7 +45,7 @@ from .member_registry import MemberRegistry
 from .platform_port import JoinRequest
 from .plugin_config import PluginConfig
 
-Decision = Literal["approve", "decline", "skip"]
+Decision = Literal["approve", "decline", "skip", "defer"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +99,9 @@ class AdmissionService:
         if delay > 0:
             await asyncio.sleep(delay)
 
-    async def admit_request(self, req: JoinRequest) -> AdmissionResult:
+    async def admit_request(
+        self, req: JoinRequest, *, retry_unknown: bool = False
+    ) -> AdmissionResult:
         """
         处理单条入群申请（JoinRequest），完成 UID 校验 → 飞书 → 决策。
 
@@ -113,7 +115,8 @@ class AdmissionService:
 
         # 去重:join_request_id 维度。
         # dedup() 语义:True=首次出现(继续处理),False=重复(跳过)。
-        if not self._store.dedup(key):
+        # retry_unknown=True 是「10 分钟后复查」的第二次进入，跳过去重。
+        if not retry_unknown and not self._store.dedup(key):
             logger.debug(f"[Admission] 重复申请跳过 {key}")
             return AdmissionResult(decision="skip", uid=None, reason="duplicate")
 
@@ -146,6 +149,19 @@ class AdmissionService:
                     decision="decline",
                     uid=uid,
                     reason="该B站UID不存在，请核对后重新申请",
+                )
+            if (
+                check.status == "unknown"
+                and not retry_unknown
+                and self._config.bili.retry_seconds > 0
+            ):
+                # 风控/超时不急着放行：先返回 defer，由调用方 10 分钟后复查一次
+                logger.info(
+                    f"[Admission] UID 校验未知，{self._config.bili.retry_seconds}s 后复查: "
+                    f"group={group} user={user} uid={uid} detail={check.detail}"
+                )
+                return AdmissionResult(
+                    decision="defer", uid=uid, reason="uid_check_unknown"
                 )
 
         # 飞书落库（经 MemberRegistry 深 module）

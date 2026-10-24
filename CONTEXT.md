@@ -10,7 +10,8 @@
 - **JoinRequest** — 归一后的入群申请 DTO（group_openid + member_openid + join_request_id + comment）
 - **Config** — 插件配置的强类型视图，一次性解析与钳制
 - **BiliUidChecker** — B站 UID 存在性校验（exists / not_found / unknown）；
-  unknown（超时/风控/网络错误）由调用方放行，只有 not_found 才拒绝
+  unknown（超时/风控/网络错误）先暂缓审批，隔 10 分钟复查一次，仍 unknown 才放行；
+  只有 not_found 才拒绝
 
 Seams：
 - Admission ↔ MemberRegistry / AdmissionsStore / Config
