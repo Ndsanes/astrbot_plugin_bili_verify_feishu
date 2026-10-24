@@ -23,6 +23,7 @@ from astrbot_plugin_bili_verify_feishu.admission import (
     _extract_uid,
 )
 from astrbot_plugin_bili_verify_feishu.admissions_store import AdmissionsStore
+from astrbot_plugin_bili_verify_feishu.bili_uid import BiliUidChecker
 from astrbot_plugin_bili_verify_feishu.platform_port import JoinRequest
 from astrbot_plugin_bili_verify_feishu.plugin_config import PluginConfig
 
@@ -53,13 +54,18 @@ class Harness:
 _ZERO_DELAY = {"REQUEST_DELAY_MIN_SECONDS": 0, "REQUEST_DELAY_MAX_SECONDS": 0}
 
 
-def make_harness(tmp_path, registry: FakeRegistry | None = None, groups=("g1",)) -> Harness:
+def make_harness(
+    tmp_path,
+    registry: FakeRegistry | None = None,
+    groups=("g1",),
+    checker: BiliUidChecker | None = None,
+) -> Harness:
     store = AdmissionsStore(data_dir=tmp_path)
     store._save_whitelist_to_file(list(groups))
     reg = registry if registry is not None else FakeRegistry()
     # 延迟钳为 0：决策域测试不测随机 sleep（_delay_if_needed 另有专项用例）
     config = PluginConfig.from_dict(_ZERO_DELAY)
-    return Harness(AdmissionService(reg, store, config), store, reg)
+    return Harness(AdmissionService(reg, store, config, checker=checker), store, reg)
 
 
 def make_req(**kw) -> JoinRequest:
@@ -232,3 +238,39 @@ async def test_delay_max小于min时钳到定值(monkeypatch):
     svc = AdmissionService(FakeRegistry(), AdmissionsStore(memory_only=True), config)
     await svc._delay_if_needed()
     assert slept == [3.0]  # dmax == dmin → 固定延迟，无随机抖动
+
+
+@pytest.mark.asyncio
+async def test_decline_UID不存在时不写飞书(tmp_path):
+    """B站明确返回 -404 时按无效 UID 拒绝，且不落库。"""
+    checker = BiliUidChecker(fetcher=lambda uid: {"code": -404, "message": "啥都木有"})
+    h = make_harness(tmp_path, checker=checker)
+    result = await h.service.admit_request(make_req(comment="UID 999999999999"))
+
+    assert result.decision == "decline"
+    assert result.reason == "该B站UID不存在，请核对后重新申请"
+    assert h.registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_接口未知时放行(tmp_path):
+    """B站接口超时/风控时不能误伤真实用户：按未知放行。"""
+    checker = BiliUidChecker(fetcher=lambda uid: {"code": -352})
+    h = make_harness(tmp_path, checker=checker)
+    result = await h.service.admit_request(make_req(comment="UID 123456789"))
+
+    assert result.decision == "approve"
+    assert h.registry.calls == [(123456789, "u1", "")]
+
+
+@pytest.mark.asyncio
+async def test_approve_UID存在时放行(tmp_path):
+    checker = BiliUidChecker(
+        fetcher=lambda uid: {"code": 0, "data": {"card": {"mid": uid, "name": "碧诗"}}}
+    )
+    h = make_harness(tmp_path, checker=checker)
+    result = await h.service.admit_request(make_req(comment="UID 123456789"))
+
+    assert result.decision == "approve"
+    assert result.uid == "123456789"
+    assert h.registry.calls == [(123456789, "u1", "")]

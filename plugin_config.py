@@ -125,6 +125,15 @@ class OfflineCfg:
 
 # 新增：按任务 Contract 显式拆出的深模块，seam 后提供更细粒度的 locality
 @dataclass(frozen=True, slots=True)
+class BiliCfg:
+    """B 站 UID 存在性校验的配置视图。"""
+
+    check_enabled: bool = True
+    timeout: float = 5.0
+    cache_ttl: int = 3600
+
+
+@dataclass(frozen=True, slots=True)
 class PendingCfg:
     enabled: bool = True
     interval: int = 3800
@@ -147,6 +156,7 @@ class PluginConfig:
     offline: OfflineCfg = field(default_factory=OfflineCfg)
     pending: PendingCfg = field(default_factory=PendingCfg)
     retry: RetryCfg = field(default_factory=RetryCfg)
+    bili: BiliCfg = field(default_factory=BiliCfg)
     # 原始 dict 保留，给需要透传 mapping 的旧 seam 兼容
     _raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
@@ -223,6 +233,11 @@ class PluginConfig:
             startup_limit=poll.startup_scan_limit,
         )
         retry = RetryCfg(max_retries=feishu.max_retries, delay=feishu.retry_delay)
+        bili = BiliCfg(
+            check_enabled=_safe_bool(raw.get("BILI_UID_CHECK", True), True),
+            timeout=_safe_float(raw.get("BILI_UID_CHECK_TIMEOUT", 5.0), 5.0, 0.5),
+            cache_ttl=_safe_int(raw.get("BILI_UID_CHECK_CACHE_TTL", 3600), 3600, 0),
+        )
         return cls(
             feishu=feishu,
             poll=poll,
@@ -231,6 +246,7 @@ class PluginConfig:
             offline=offline,
             pending=pending,
             retry=retry,
+            bili=bili,
             _raw=raw,
         )
 
@@ -268,6 +284,9 @@ class PluginConfig:
             "ENABLE_QQOFFICIAL_JOIN_POLL": self.poll.enabled,
             "QQOFFICIAL_POLL_INTERVAL": self.poll.interval,
             "QQOFFICIAL_POLL_LIMIT": self.poll.limit,
+            "BILI_UID_CHECK": self.bili.check_enabled,
+            "BILI_UID_CHECK_TIMEOUT": self.bili.timeout,
+            "BILI_UID_CHECK_CACHE_TTL": self.bili.cache_ttl,
         }
         return mapping.get(key, default)
 
@@ -296,6 +315,9 @@ class PluginConfig:
             "ENABLE_QQOFFICIAL_JOIN_POLL": self.poll.enabled,
             "QQOFFICIAL_POLL_INTERVAL": self.poll.interval,
             "QQOFFICIAL_POLL_LIMIT": self.poll.limit,
+            "BILI_UID_CHECK": self.bili.check_enabled,
+            "BILI_UID_CHECK_TIMEOUT": self.bili.timeout,
+            "BILI_UID_CHECK_CACHE_TTL": self.bili.cache_ttl,
         }
 
 
@@ -308,6 +330,7 @@ __all__ = [
     "OfflineCfg",
     "PendingCfg",
     "RetryCfg",
+    "BiliCfg",
     "_safe_int",
     "_safe_bool",
     "_safe_float",

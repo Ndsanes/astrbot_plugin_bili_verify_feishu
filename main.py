@@ -10,6 +10,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+from .bili_uid import BiliUidChecker
 from .feishu_client import (
     broadcast_feishu_message,
     set_gateway,
@@ -44,7 +45,7 @@ except Exception:  # pragma: no cover - 离线测试回退
     "bili_verify_feishu",
     "NDsans",
     "QQ入群请求自动登记B站UID到飞书多维表格",
-    "0.1.3",
+    "0.1.4",
     "https://github.com/Ndsanes/astrbot_plugin_bili_verify_feishu",
 )
 class BiliVerifyFeishuPlugin(Star):
@@ -66,6 +67,16 @@ class BiliVerifyFeishuPlugin(Star):
         self._offline_monitor_task: asyncio.Task | None = None
         self._offline_fail_count: int = 0
         self._offline_is_down: bool = False
+        # B站 UID 存在性校验（入群备注与群消息两条链路共用；进程内缓存）
+        self._uid_checker = BiliUidChecker(
+            enabled=self._safe_bool(self._get_config("BILI_UID_CHECK", True), default=True),
+            timeout=self._safe_float(
+                self._get_config("BILI_UID_CHECK_TIMEOUT", 5.0), default=5.0, minimum=0.5
+            ),
+            cache_ttl=self._safe_int(
+                self._get_config("BILI_UID_CHECK_CACHE_TTL", 3600), default=3600, minimum=0
+            ),
+        )
         # 深 modules（initialize 时按 PluginConfig 实例化，提供 seam）
         self._typed_config: Any | None = None
         self._admissions_store: Any | None = None
@@ -199,6 +210,7 @@ class BiliVerifyFeishuPlugin(Star):
                     registry=self._member_registry,
                     store=self._admissions_store,
                     config=self._typed_config,
+                    checker=self._uid_checker,
                 )
             logger.info(
                 "[BiliVerifyFeishu] 深 modules 已就绪："
@@ -458,6 +470,30 @@ class BiliVerifyFeishuPlugin(Star):
         for req in data.get("requests", []) or []:
             if isinstance(req, dict):
                 requests.append(dict(req))
+
+    @staticmethod
+    def _looks_like_uid_submission(text: str) -> bool:
+        """粗判这条群消息是否在「提交 UID」，用于决定校验失败时要不要出声。
+
+        群消息路径原本会对任何含 6 位以上数字的消息做写入；随机数字（订单号、
+        时间戳）被判定为「UID 不存在」时只跳过写入、不回复，避免刷屏。
+        """
+        lowered = (text or "").strip().lower()
+        if any(marker in lowered for marker in ("uid", "b站", "bilibili", "哔哩")):
+            return True
+        return re.fullmatch(r"\s*\d{6,}\s*", lowered) is not None
+
+    async def _notify_group(self, event: AstrMessageEvent, text: str) -> None:
+        """尽量在来源群发一条提示；平台不支持/事件缺失时静默降级。"""
+        try:
+            from astrbot.api.message_chain import MessageChain
+
+            umo = getattr(event, "unified_msg_origin", "") or ""
+            if not umo:
+                return
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception as e:  # 提示失败不影响主流程
+            logger.debug(f"[BiliVerifyFeishu] 群提示发送失败（忽略）: {e}")
 
     async def _resolve_nickname(
         self,
@@ -762,6 +798,21 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         uid_num = int(uid)
+        # 先确认 UID 在 B 站真实存在，再写飞书/放行（未知一律放行）
+        uid_check = await self._uid_checker.check(uid_num)
+        if uid_check.not_found:
+            logger.info(
+                "[BiliVerifyFeishu] 加群请求的B站UID不存在，拒绝: "
+                f"UID={uid}, QQ={user_id}, 群={group_id}, detail={uid_check.detail}"
+            )
+            await self._set_group_add_request(
+                event,
+                flag=flag,
+                sub_type=sub_type,
+                approve=False,
+                reason="该B站UID不存在，请核对后重新申请",
+            )
+            return
         # 兼容 openid 字符串
         qq_key: int | str = user_id
         if isinstance(user_id, str) and user_id.isdigit():
@@ -914,6 +965,18 @@ class BiliVerifyFeishuPlugin(Star):
         if uid is None:
             return
 
+        # 校验 UID 是否真实存在；不存在时保留 pending，允许用户重新发送正确 UID
+        uid_check = await self._uid_checker.check(int(uid))
+        if uid_check.not_found:
+            logger.info(
+                "[BiliVerifyFeishu] 群消息中的B站UID不存在: "
+                f"UID={uid}, QQ={user_id}, 群={group_id}, detail={uid_check.detail}"
+            )
+            await self._notify_group(
+                event, f"B站UID {uid} 不存在，请核对后重新发送正确的 UID。"
+            )
+            return
+
         # 从待处理集合中移除
         self._pending_uid.discard(key)
 
@@ -997,6 +1060,19 @@ class BiliVerifyFeishuPlugin(Star):
 
         uid = self._extract_uid(text)
         if uid is None:
+            return
+
+        # 校验 UID 是否真实存在；不存在时不写飞书，并提示发送者
+        uid_check = await self._uid_checker.check(int(uid))
+        if uid_check.not_found:
+            logger.info(
+                "[BiliVerifyFeishu][qq_official] 群消息中的B站UID不存在: "
+                f"UID={uid}, QQ={user_id}, 群={group_id}, detail={uid_check.detail}"
+            )
+            if self._looks_like_uid_submission(text):
+                await self._notify_group(
+                    event, f"B站UID {uid} 不存在，请核对后重新发送正确的 UID。"
+                )
             return
 
         key = f"{group_id}:{user_id}"
@@ -1544,6 +1620,20 @@ class BiliVerifyFeishuPlugin(Star):
             return
 
         uid_num = int(uid)
+        uid_check = await self._uid_checker.check(uid_num)
+        if uid_check.not_found:
+            logger.info(
+                "[BiliVerifyFeishu] 入群申请的B站UID不存在（浅路径），拒绝: "
+                f"UID={uid}, openid={member_openid}, 群={group_openid}"
+            )
+            await self._qqofficial_approve_join_request(
+                group_openid=group_openid,
+                member_openid=member_openid,
+                join_request_id=join_request_id,
+                approve=False,
+                reject_reason="该B站UID不存在，请核对后重新申请",
+            )
+            return
         qq_key: int | str = member_openid
         time_ms = int(datetime.now(UTC).timestamp() * 1000)
         nickname = username or await self._resolve_nickname(

@@ -135,5 +135,23 @@
     "type": "int",
     "default": 20,
     "hint": "GET join_request_list 的 limit 参数，默认 20，最大 100"
+  },
+  "BILI_UID_CHECK": {
+    "description": "是否校验B站UID真实存在",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，入群备注或群消息里的 UID 会调用 B站公开接口确认账号存在；明确不存在则拒绝/不写入，接口超时或风控时按「未知」放行，避免误伤真实用户。"
+  },
+  "BILI_UID_CHECK_TIMEOUT": {
+    "description": "B站UID校验超时（秒）",
+    "type": "float",
+    "default": 5.0,
+    "hint": "单次查询 B站接口的最长等待时间，超时按「未知」放行。建议 3~8 秒。"
+  },
+  "BILI_UID_CHECK_CACHE_TTL": {
+    "description": "B站UID校验结果缓存（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "同一 UID 在缓存期内不会重复请求 B站接口；「不存在」的结果最多缓存 600 秒。设为 0 可关闭缓存。"
   }
 }

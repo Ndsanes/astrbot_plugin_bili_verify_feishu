@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover
     logger = _l.getLogger(__name__)
 
 from .admissions_store import AdmissionsStore
+from .bili_uid import BiliUidChecker
 from .member_registry import MemberRegistry
 from .platform_port import JoinRequest
 from .plugin_config import PluginConfig
@@ -79,10 +80,13 @@ class AdmissionService:
         registry: MemberRegistry,
         store: AdmissionsStore,
         config: PluginConfig,
+        checker: BiliUidChecker | None = None,
     ) -> None:
         self._registry = registry
         self._store = store
         self._config = config
+        # 可选注入：未注入时跳过存在性校验（保持旧行为 / 测试可裁剪）
+        self._checker = checker
 
     async def _delay_if_needed(self) -> None:
         dmin = float(self._config.delays.min_seconds or 0)
@@ -128,6 +132,21 @@ class AdmissionService:
             return AdmissionResult(
                 decision="decline", uid=None, reason="请在入群验证信息中提供B站UID"
             )
+
+        # UID 存在性校验：只有 B 站明确返回 -404 才拒绝；
+        # 超时/风控/网络错误一律按 unknown 放行，避免误伤真实用户。
+        if self._checker is not None:
+            check = await self._checker.check(int(uid))
+            if check.not_found:
+                logger.info(
+                    f"[Admission] B站UID不存在，拒绝 group={group} user={user} "
+                    f"uid={uid} detail={check.detail}"
+                )
+                return AdmissionResult(
+                    decision="decline",
+                    uid=uid,
+                    reason="该B站UID不存在，请核对后重新申请",
+                )
 
         # 飞书落库（经 MemberRegistry 深 module）
         ok = await self._registry.register(int(uid), user, req.username)
